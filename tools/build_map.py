@@ -83,6 +83,8 @@ for path in sorted(cov.measured_files()):
         "users": sid(users),           # every test that ran any line of this file
         "lines": lines,                # line -> set id (only lines some test ran)
         "spans": spans(tree),
+        # lambda bodies [first line, last line]: run when called, not at import
+        "lambdas": sorted([n.body.lineno, n.body.end_lineno] for n in ast.walk(tree) if isinstance(n, ast.Lambda)),
         # function bodies [first body line, last line]: who entered a function = who ran any line in it
         "funcs": sorted([n.body[0].lineno, n.end_lineno] for n in ast.walk(tree)
                         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))),

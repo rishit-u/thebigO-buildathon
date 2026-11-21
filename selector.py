@@ -161,8 +161,23 @@ class Selector:
                 k -= 1
             return None
 
-        def tests_for_stmt(st):
+        def in_lambda(ln):
+            """Tests that called the innermost lambda whose body holds ln, if ln is runtime-only code."""
+            if ln in import_lines: return None
+            best = None
+            for a, b in info.get("lambdas", []):
+                if a <= ln <= b and (best is None or b - a < best[1] - best[0]): best = (a, b)
+            if best is None: return None
+            ts = set()
+            for x in range(best[0], best[1] + 1):
+                if str(x) in lines: ts |= set(self.sets[lines[str(x)]])
+            return ts
+
+        def tests_for_stmt(st, ln=None):
             s, e, scope = st
+            if scope == "m" and ln is not None and not registry:
+                lam = in_lambda(ln)
+                if lam is not None: return lam, "lambda body"
             if scope == "m":   # runs at import: who depends on it is who uses this module's objects
                 if registry: return self.ALL, f"module-level, {registry}"
                 return mod_users, "module-level"
@@ -177,13 +192,13 @@ class Selector:
             st = stmt_at(ln)
             if st is None:   # blank/comment line outside any statement: look at neighbours
                 inserted.add(ln); continue
-            ts, kind = tests_for_stmt(st); picked |= ts
+            ts, kind = tests_for_stmt(st, ln); picked |= ts
             if kind != "function": why.append(f"{path}:{ln} {kind} -> {len(ts)}")
         for ln in sorted(inserted):
             for nb in (ln - 1, ln):   # statements just above and at the insertion point
                 st = stmt_at(nb)
                 if st is None: continue
-                ts, kind = tests_for_stmt(st); picked |= ts
+                ts, kind = tests_for_stmt(st, nb); picked |= ts
             if stmt_at(ln - 1) is None and stmt_at(ln) is None:
                 if registry: picked |= self.ALL; why.append(f"{path}:{ln} insert, {registry} -> all")
                 else: picked |= mod_users; why.append(f"{path}:{ln} insert at module level -> {len(mod_users)}")

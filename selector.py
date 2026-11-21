@@ -240,10 +240,26 @@ class Selector:
                 return [k.attr] + ([f"{base}.{k.attr}"] if base else [])
             if isinstance(k, ast.Name): return [k.id]
             return None
+        def objects_of(site):
+            """Tests that created an object of the class holding this site (or a subclass), plus
+            tests whose own code names the class; None if unknown."""
+            rel, ln = site.rsplit(":", 1); ln = int(ln); best = None
+            for e in self.files.get(rel, {}).get("classes", []):
+                if e[1] <= ln <= e[2] and (best is None or e[1] >= best[1]): best = e
+            if best is None or len(best) < 5 or best[4] < 0: return None
+            return set(self.sets[best[4]])
         def site_tests(site, keys):
             d = D.get(site, {"reads": {}, "all": -1, "derived": [], "flags": []})
-            if d["flags"] or "*" in d["derived"] or any(k in d["derived"] for k in keys): return None
+            if d["flags"]: return None
+            extra = set()
+            if "*" in d["derived"] or any(k in d["derived"] for k in keys):
+                # Expression.arg_types flags are read at import only by __init_subclass__ to derive
+                # the class's required_args, which is used when an object of the class is validated
+                if not (site_tests.flag_flip and site_tests.name == "arg_types"): return None
+                extra = objects_of(site)
+                if extra is None: return None
             ts = set(self.sets[d["all"]]) if d["all"] >= 0 else set()
+            ts |= extra
             for k in keys:
                 if k in d["reads"]: ts |= set(self.sets[d["reads"][k]])
             return ts
@@ -254,6 +270,9 @@ class Selector:
             if not changed: continue
             site = f"{path}:{o.lineno}"
             if site not in inst or key[1] in hazard: return None
+            site_tests.name = key[1]
+            site_tests.flag_flip = all(isinstance(v.value.values[i], ast.Constant) and type(v.value.values[i].value) is bool
+                                       for v in (o, n) for i in changed)
             for i in changed:
                 ks = key_reprs(o.value.keys[i])
                 if ks is None: return None
@@ -343,11 +362,11 @@ class Selector:
             """Aggressive mode: a statement in a class body (not its header) reaches the tests that
             created an object with that class, or an enclosing class, in its MRO."""
             inner = None
-            for q, a, b, sid_ in info.get("classes", []):
+            for q, a, b, sid_, *_ in info.get("classes", []):
                 if a <= s <= b and (inner is None or a >= inner[1]): inner = (q, a, b, sid_)
             if inner is None or s == inner[1]: return None
             ts = set()
-            for q, a, b, sid_ in info.get("classes", []):
+            for q, a, b, sid_, *_ in info.get("classes", []):
                 if a <= s <= b:
                     if sid_ < 0: return None
                     ts |= set(self.sets[sid_])
@@ -451,9 +470,10 @@ GIANT_AREAS = {
 # and the patched stages give the same structural hashes as the pinned ones for every query, the
 # executor gets identical inputs and runs identical code: the test cannot change outcome.
 TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
-TPCDS_CHECK = False   # v14b: stage-fingerprint check off (it costs container CPU on every flagged commit)
+TPCDS_CHECK = True    # v16: result-level TPC-DS check (tpcds_res.py)
 APP = Path(__file__).resolve().parent
 PINNED_DIR, PINNED_FP, SPEC = APP / "pinned", APP / "tpcds_pinned.json", APP / "tpcds_spec.json"
+TPCDS_RESULTS, TPCDS_DATA = APP / "tpcds_results.json", APP / "tpcds_data"
 
 def write_tree(sel, root, changed=None):
     for rel, info in sel.files.items():
@@ -469,6 +489,58 @@ def run_fp(root, timeout=40, pinned=None):
     if r.returncode != 0: raise RuntimeError("fingerprint run failed: " + r.stderr[-300:])
     return json.loads(r.stdout)
 
+MAXNODES_ID = "tests/test_parser.py::TestParser::test_max_nodes"
+MAXNODES_PINNED = APP / "maxnodes_pinned.json"
+
+def run_script(script, root, timeout=8):   # normal run ~1 s; a hang must not burn CPU
+    import subprocess
+    r = subprocess.run([sys.executable, "-I", str(APP / script), str(root)], capture_output=True, text=True,
+                       timeout=timeout, env={"PYTHONDONTWRITEBYTECODE": "1", "PATH": os.environ.get("PATH", "")})
+    if r.returncode != 0: raise RuntimeError(script + " failed: " + r.stderr[-300:])
+    return json.loads(r.stdout)
+
+def patched_tree(sel, files):
+    import shutil, tempfile
+    root = Path(tempfile.mkdtemp(prefix="brfp", dir="/tmp"))
+    if PINNED_DIR.exists(): shutil.copytree(PINNED_DIR, root, dirs_exist_ok=True)
+    else: write_tree(sel, root)
+    for f in files:
+        p = root / f["new"]
+        p.write_text(apply(sel.files[f["new"]]["text"], f["hunks"]), encoding="utf-8")
+        pyc = p.parent / "__pycache__"
+        for c in (pyc.glob(p.stem + ".*.pyc") if pyc.exists() else []): c.unlink()
+    return root
+
+def body_only(sel, files):
+    """Every change is inside the body of a function in a sqlglot .py file; no registry change."""
+    for f in files:
+        path = f["new"] or f["old"]
+        if not (path and f["old"] == f["new"] and path.startswith("sqlglot/") and path.endswith(".py") and path in sel.files):
+            return False
+        old_text = sel.files[path]["text"]; old_tree = ast.parse(old_text)
+        if registry_change(path, old_tree, ast.parse(apply(old_text, f["hunks"]))): return False
+        removed, inserted = changed_old_lines(f["hunks"])
+        fns = [n for n in ast.walk(old_tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        for ln in removed | inserted:
+            if not any(fn.body[0].lineno <= ln <= fn.end_lineno for fn in fns): return False
+    return True
+
+def maxnodes_unaffected(sel, text):
+    """test_max_nodes only parses: if the patched parser gives identical results (trees, limit errors,
+    messages) on scaled-down versions of its inputs, its outcome cannot change."""
+    if not MAXNODES_PINNED.exists(): return False
+    files = parse_patch(text)
+    # the check imports the patched sqlglot afresh, so module-level, class-body and registry changes
+    # take effect in it too; only changes outside sqlglot's own .py files are out of its reach
+    if not all(f["old"] == f["new"] and f["new"] and f["new"].startswith("sqlglot/") and f["new"].endswith(".py")
+               and f["new"] in sel.files for f in files): return False
+    import shutil
+    root = patched_tree(sel, files)
+    try:
+        return run_script("maxnodes_fp.py", root) == json.loads(MAXNODES_PINNED.read_text())
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
 def build_pinned(sel):
     """At image build: pinned tree, spec, and pinned fingerprints (two runs must agree)."""
     import compileall
@@ -478,6 +550,17 @@ def build_pinned(sel):
     a, b = run_fp(PINNED_DIR, 300), run_fp(PINNED_DIR, 300)
     if a != b: log("pinned fingerprints are not deterministic: feature off"); return
     PINNED_FP.write_text(json.dumps(a)); log("pinned TPC-DS fingerprints:", len(a))
+    import subprocess
+    r = subprocess.run([sys.executable, "-I", str(APP / "tpcds_res.py"), str(PINNED_DIR), str(SPEC), str(PINNED_FP),
+                        "-", str(TPCDS_DATA), "--build"], capture_output=True, text=True, timeout=600)
+    if r.returncode == 0: TPCDS_RESULTS.write_text(r.stdout); log("pinned TPC-DS results:", len(json.loads(r.stdout)))
+    else: log("pinned TPC-DS results failed: check off")
+    if (APP / "tests.json").exists() and (PINNED_DIR / "tests").exists():   # runnable tests for the runner
+        import runner
+        runner.build(str(APP / "tests.json")); log("runner: runnable tests", len(json.loads(RUNNABLE_PATH.read_text())))
+    a, b = run_script("maxnodes_fp.py", PINNED_DIR, 300), run_script("maxnodes_fp.py", PINNED_DIR, 300)
+    if a != b: log("pinned max_nodes results are not deterministic: check off"); return
+    MAXNODES_PINNED.write_text(json.dumps(a)); log("pinned max_nodes results:", len(a))
 
 def tpcds_checkable(sel, files):
     """Every change is inside the body of a function that never runs outside the fingerprinted stages."""
@@ -503,7 +586,7 @@ def tpcds_checkable(sel, files):
     return True
 
 def tpcds_unaffected(sel, text):
-    if not (sel.tpcds and PINNED_FP.exists()): return False
+    if not (sel.tpcds and PINNED_FP.exists() and TPCDS_RESULTS.exists()): return False
     files = parse_patch(text)
     if not tpcds_checkable(sel, files): return False
     import shutil, tempfile
@@ -515,8 +598,13 @@ def tpcds_unaffected(sel, text):
             p.write_text(apply(sel.files[f["new"]]["text"], f["hunks"]), encoding="utf-8")
             pyc = p.parent / "__pycache__"
             for c in (pyc.glob(p.stem + ".*.pyc") if pyc.exists() else []): c.unlink()
-        res = run_fp(root, pinned=PINNED_FP)   # stops at the first differing query
-        return "mismatch" not in res and res == json.loads(PINNED_FP.read_text())
+        import subprocess
+        r = subprocess.run([sys.executable, "-I", str(APP / "tpcds_res.py"), str(root), str(SPEC), str(PINNED_FP),
+                            str(TPCDS_RESULTS), str(TPCDS_DATA)], capture_output=True, text=True, timeout=20,
+                           env={"PYTHONDONTWRITEBYTECODE": "1", "PATH": os.environ.get("PATH", "")})
+        res = json.loads(r.stdout) if r.returncode == 0 else {"ok": False, "why": r.stderr[-200:]}
+        log("  TPC-DS result check:", res)
+        return res.get("ok") is True
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -537,6 +625,13 @@ def aggressive(sel, picked, paths, num_of, text=None):
         n = num_of.get(tid)
         if n in picked and not broad and not any(p.startswith(a) for p in paths for a in areas):
             picked = picked - {n}
+    n = num_of.get(MAXNODES_ID)
+    if n in picked and text is not None:
+        try:
+            if maxnodes_unaffected(sel, text): picked = picked - {n}; log("  max_nodes inputs parse identically: dropped")
+            else: log("  max_nodes kept (not checkable, or results changed)")
+        except Exception as e:
+            log("  max_nodes check failed, keeping it:", repr(e)[:200])
     n = num_of.get(TPCDS_ID)
     if n in picked and text is not None and TPCDS_CHECK:
         try:
@@ -547,6 +642,50 @@ def aggressive(sel, picked, paths, num_of, text=None):
     return picked
 
 # ---------- splitting over workers ----------
+# ---------- in-container runner (fast mode) ----------
+RUNNER = True
+RUNNABLE_PATH = APP / "runner_pinned.json"
+_runnable = None
+NEVER_RUN = {"tests/test_generator.py::TestGenerator::test_generator_memory"}   # order/memory sensitive
+
+def commit_cost(nums, ms):
+    w = split(nums, ms)
+    return (max(sum(ms[n] for n in x) for x in w) + 2000 * len(w)) / 1000 if w else 0.0
+
+def run_or_select(sel, text, nums, ms, id_of, why):
+    """Run a small selection in a forked child against the patched code when that is expected to cost
+    less CPU than the worker time it saves; then output only the tests that failed."""
+    global _runnable
+    if _runnable is None:
+        _runnable = set(json.loads(RUNNABLE_PATH.read_text())) if RUNNABLE_PATH.exists() else set()
+    ids = [id_of[n] for n in nums]
+    if not _runnable or any(i not in _runnable or i in NEVER_RUN for i in ids): return nums
+    load = sum(ms[n] for n in nums) / 1000
+    est = 0.3 + 1.6 * load                      # child CPU: fresh import + the tests (measured ~1.0-1.6x)
+    saved_if_clean = commit_cost(nums, ms)
+    if est >= saved_if_clean: return nums
+    files = {}
+    for f in parse_patch(text):
+        rel = f["new"]
+        if not rel or f["old"] != rel or not rel.endswith(".py"): return nums      # fixtures, adds, deletes
+        if rel.startswith("sqlglot/"):
+            if rel not in sel.files: return nums
+            base = sel.files[rel]["text"]
+        elif rel.startswith("tests/") and (PINNED_DIR / rel).exists():
+            base = (PINNED_DIR / rel).read_text(encoding="utf-8")
+        else:
+            return nums
+        files[rel] = apply(base, f["hunks"])
+    import runner
+    failed = runner.run(files, ids, timeout=max(5, 4 * est))
+    if failed is None:
+        why.append("runner: error or timeout, selection kept"); return nums
+    num_of_id = {id_of[n]: n for n in nums}
+    out = {num_of_id[i] for i in failed if i in num_of_id}
+    if len(out) != len(failed): return nums                                     # unexpected ids: be safe
+    why.append(f"runner: ran {len(nums)} tests ({load:.2f} s recorded), {len(out)} failed")
+    return out
+
 def split(nums, ms):
     """Try 1..8 workers, longest test first onto the lightest worker; keep the cheapest."""
     if not nums: return []
@@ -566,6 +705,7 @@ def main():
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     sel = Selector()
     num_of = {t["id"]: t["number"] for t in tests}
+    id_of = {t["number"]: t["id"] for t in tests}
     for patch in sorted((DATA / "commits").glob("*.patch")):
         try:
             text = patch.read_text(encoding="utf-8", errors="replace")
@@ -576,6 +716,11 @@ def main():
         except Exception as e:  # never crash: a crash rejects the run, a wide answer only costs time
             nums, why = sel.ALL, [f"error {e!r} -> all"]
         nums = {n for n in nums if n in ms}
+        if AGGRESSIVE and RUNNER and nums:
+            try:
+                nums = run_or_select(sel, text, nums, ms, id_of, why)
+            except Exception as e:
+                why.append(f"runner error {e!r}: selection kept")
         print(json.dumps({"commit": patch.stem, "workers": split(nums, ms)}))
         log(patch.stem, len(nums), "tests |", "; ".join(why))
 

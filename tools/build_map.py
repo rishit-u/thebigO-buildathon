@@ -257,6 +257,23 @@ for rel, info in files.items():
     info["scalar_attrs"] = entries
 print(f"scalar attributes with symbol-level reads: {kept}", file=sys.stderr)
 
+# Value-level facts at comparisons (tools/valprof.py): per site, the tests in which swapping the operator
+# for its sibling (is/==, is not/!=, </<=, >/>=) could change the result. -1 = it could during import or
+# outside any test, i.e. for everyone.
+hz = {"eq": {}, "ord": {}}
+for f in glob.glob(os.path.join(reads_dir, "valprof-*.json")):
+    d = json.load(open(f))
+    for fam in ("eq", "ord"):
+        for site, ctxs in d[fam].items(): hz[fam].setdefault(site, set()).update(ctxs)
+for rel, info in files.items(): info["cmp_hazard"] = {}
+for fam in ("eq", "ord"):
+    for site, ctxs in hz[fam].items():
+        rel, ln, col = site.rsplit(":", 2)
+        if rel not in files: continue
+        entry = files[rel]["cmp_hazard"].setdefault(f"{ln}:{col}", {})
+        entry[fam] = -1 if any(c.startswith("<") and not c.startswith("<class>") for c in ctxs) else sid(ctx_tests(ctxs))
+profiled = bool(glob.glob(os.path.join(reads_dir, "valprof-*.json")))
+
 # Test files: their own tests, plus tests in files that import them (helpers, base classes).
 by_file = {}
 for t in T["tests"]: by_file.setdefault(t["file"], []).append(t["number"])
@@ -272,6 +289,6 @@ for p in pyfiles:
             nums |= set(by_file.get(os.path.relpath(q, src), []))
     test_files[rel] = sid(nums if nums else ALL)
 
-json.dump({"sets": sets, "all": sid(ALL), "files": files, "reads": read_map, "test_files": test_files},
+json.dump({"sets": sets, "all": sid(ALL), "profiled": profiled, "files": files, "reads": read_map, "test_files": test_files},
           open(out, "w"), separators=(",", ":"))
 print(f"{len(files)} source files, {len(sets)} unique test sets, {len(read_map)} read files, {os.path.getsize(out)/1e6:.1f} MB", file=sys.stderr)

@@ -3,7 +3,7 @@
 # labeled with), so the coverage map matches their environment.
 #
 # Run from the repository root:   bash tools/build_map_docker.sh
-# Needs Docker and git. Takes about 5-10 minutes (longer on Apple Silicon, which emulates amd64).
+# Needs Docker and git. Two test passes; takes about 10-15 minutes (longer on Apple Silicon, which emulates amd64).
 set -euo pipefail
 
 IMAGE="python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90"
@@ -27,6 +27,8 @@ docker run --rm --platform linux/amd64 \
     python -c "import sqlite3; print(\"sqlite\", sqlite3.sqlite_version)"
     python -m pytest tests -q -p no:cacheprovider -p brplugin -n 2 \
       --cov=sqlglot --cov-context=test --cov-report= | tail -3
+    # second pass: value-level facts at comparisons (no coverage)
+    python -m pytest tests -q -p no:cacheprovider -p valprof -n 2 | tail -3
     python /repo/tools/build_map.py /work/sqlglot /repo/sample/tests.json /work/reads /work/map.json
     gzip -9f /work/map.json
   '

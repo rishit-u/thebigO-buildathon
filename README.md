@@ -22,7 +22,16 @@ cheapest number of workers. See `SCORING.md` for the exact rules.
 3. The chosen tests are split longest-first onto the lightest worker, trying
    1..8 workers and keeping the cheapest.
 
+## What v9 adds
+
+- Symbol-level reads for scalar class attributes (v7), runtime caches credited to every user (v8).
+- A value-level map (`tools/valprof.py`): for every single comparison, the tests in which swapping the
+  operator for its sibling (`is`/`==`, `is not`/`!=`, `<`/`<=`, `>`/`>=`) could change the result. A patch
+  that is only such a swap selects exactly those tests (often none).
+
 ## Rebuilding the map
+
+Easiest, in the organizers' exact image: `bash tools/build_map_docker.sh`. By hand:
 
     git clone https://github.com/tobymao/sqlglot && git -C sqlglot checkout eb11aec4be8cb2122afe713a4816662c3f0fb2fa
     pip install -r requirements.lock pytest-cov
@@ -30,4 +39,6 @@ cheapest number of workers. See `SCORING.md` for the exact rules.
       python -m pytest tests -p no:cacheprovider -p brplugin -n 2 --cov=sqlglot --cov-context=test --cov-report=
     cd .. && python tools/build_map.py sqlglot sample/tests.json /tmp/reads map.json && gzip -9f map.json
 
-(mkdir /tmp/reads first.)
+    cd sqlglot && SKIP_INTEGRATION=0 BR_READS_DIR=/tmp/reads PYTHONPATH=.:../tools python -m pytest tests -p no:cacheprovider -p valprof -n 2
+
+(mkdir /tmp/reads first; run both passes before `build_map.py`.)

@@ -113,6 +113,30 @@ def new_scalar_ok(tree, cls, name):
     if not found: return True
     return len(found) == 1 and isinstance(found[0], (ast.Assign, ast.AnnAssign)) and found[0].value is not None and scalar_literal(found[0].value)
 
+SIBLINGS = {frozenset({ast.Is, ast.Eq}): "eq", frozenset({ast.IsNot, ast.NotEq}): "eq",
+            frozenset({ast.Lt, ast.LtE}): "ord", frozenset({ast.Gt, ast.GtE}): "ord"}
+
+def operator_swaps(old, new):
+    """If the two trees differ only in single-operator comparisons, list (line, col, family) for each
+    changed comparison; family is None when the swap is not between siblings. Otherwise return None."""
+    out = []
+    def same(a, b):
+        if type(a) is not type(b): return False
+        if isinstance(a, ast.AST):
+            for field in a._fields:
+                va, vb = getattr(a, field, None), getattr(b, field, None)
+                if isinstance(a, ast.Compare) and field == "ops":
+                    ta, tb = [type(x) for x in va], [type(x) for x in vb]
+                    if ta != tb:
+                        if len(ta) != 1 or len(tb) != 1: return False
+                        out.append((a.lineno, a.col_offset, SIBLINGS.get(frozenset({ta[0], tb[0]}))))
+                    continue
+                if not same(va, vb): return False
+            return True
+        if isinstance(a, list): return len(a) == len(b) and all(same(x, y) for x, y in zip(a, b))
+        return a == b
+    return out if same(old, new) else None
+
 GLOBAL_CLASS_ATTRS = {"_sql_names"}   # read at import into registries shared by every dialect
 
 def registry_change(path, old, new):
@@ -147,6 +171,7 @@ class Selector:
         m = json.loads(gzip.decompress(MAP.read_bytes()))
         self.sets = m["sets"]; self.files = m["files"]; self.reads = m["reads"]
         self.test_files = m["test_files"]; self.ALL = set(self.sets[m["all"]])
+        self.profiled = m.get("profiled", False)
 
     def py_source(self, path, hunks, why):
         info = self.files[path]
@@ -159,7 +184,18 @@ class Selector:
         if ast.dump(new_tree) == info["ast"]:
             why.append(f"{path}: same AST (comment/whitespace) -> {len(readers)} source readers"); return readers
         mod_users = set(self.sets[info["mod_users"]])
-        registry = registry_change(path, ast.parse(info["text"]), new_tree)
+        old_tree = ast.parse(info["text"])
+        if self.profiled:
+            swaps = operator_swaps(old_tree, new_tree)
+            if swaps and all(fam for _, _, fam in swaps):
+                picked = set(readers)
+                for ln, col, fam in swaps:
+                    sid_ = info.get("cmp_hazard", {}).get(f"{ln}:{col}", {}).get(fam)
+                    if sid_ == -1: why.append(f"{path}:{ln} operator swap, hazard at import -> all"); return self.ALL
+                    ts = set(self.sets[sid_]) if sid_ is not None else set()
+                    picked |= ts; why.append(f"{path}:{ln} {fam} operator swap -> {len(ts)} tests where it could differ")
+                return picked
+        registry = registry_change(path, old_tree, new_tree)
         spans = info["spans"]; starts = [s[0] for s in spans]
         lines, users = info["lines"], set(self.sets[info["users"]])
         import_lines = set(info.get("import_lines", []))

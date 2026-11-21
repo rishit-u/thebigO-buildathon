@@ -1,5 +1,5 @@
 """pytest plugin: record which non-Python repo files each test opens (fixture map)."""
-import builtins, io, json, os
+import builtins, io, json, os, sys
 ROOT = os.getcwd()
 _current = ["<collect>"]
 _reads = {}
@@ -9,7 +9,7 @@ def _rec(path):
         p = os.path.realpath(os.fspath(path))
     except TypeError:
         return
-    if p.startswith(ROOT + os.sep) and not p.endswith((".py", ".pyc")):
+    if p.startswith(ROOT + os.sep) and not p.endswith(".pyc"):
         _reads.setdefault(_current[0], set()).add(os.path.relpath(p, ROOT))
 def _open(file, *a, **k):
     if isinstance(file, (str, bytes, os.PathLike)):
@@ -35,6 +35,19 @@ def pytest_sessionfinish(session):
     out = os.environ.get("BR_READS_DIR", "/tmp")
     with _orig(os.path.join(out, f"reads-{os.getpid()}.json"), "w") as f:
         json.dump({k: sorted(v) for k, v in _reads.items()}, f)
+    # for every test: the source files of every class in the MRO of what it instantiated
+    mods = {}
+    for ctx, types in _types.items():
+        files = set()
+        for t in types:
+            for c in t.__mro__:
+                m = sys.modules.get(c.__module__)
+                f = getattr(m, "__file__", None)
+                if f and os.path.realpath(f).startswith(ROOT + os.sep):
+                    files.add(os.path.relpath(os.path.realpath(f), ROOT))
+        mods[ctx] = sorted(files)
+    with _orig(os.path.join(out, f"inst-{os.getpid()}.json"), "w") as f:
+        json.dump(mods, f)
 
 
 # --- run process pools in-process so coverage sees the work done "in" them ---
@@ -78,3 +91,26 @@ def pytest_sessionstart(session):
             importlib.import_module(info.name)
         except Exception:
             pass
+    _install_instance_recorder()
+
+
+# --- which classes each test instantiates (dialects, parsers, generators, expressions...) ---
+_types = {}
+
+def _install_instance_recorder():
+    from sqlglot.expressions.core import Expr
+    from sqlglot.dialects.dialect import Dialect
+    from sqlglot.parser import Parser
+    from sqlglot.generator import Generator
+    from sqlglot.tokens import Tokenizer
+    from sqlglot.optimizer.annotate_types import TypeAnnotator
+    from sqlglot.optimizer.scope import Scope
+    import sqlglot.schema as schema_mod
+    bases = [Expr, Dialect, Parser, Generator, Tokenizer, TypeAnnotator, Scope]
+    bases += [c for c in vars(schema_mod).values() if isinstance(c, type) and c.__module__ == schema_mod.__name__ and "__init__" in vars(c)]
+    for base in bases:
+        orig = base.__init__
+        def wrapped(self, *a, __orig=orig, **k):
+            _types.setdefault(_current[0], set()).add(type(self))
+            return __orig(self, *a, **k)
+        base.__init__ = wrapped

@@ -116,12 +116,45 @@ def new_scalar_ok(tree, cls, name):
 SIBLINGS = {frozenset({ast.Is, ast.Eq}): "eq", frozenset({ast.IsNot, ast.NotEq}): "eq",
             frozenset({ast.Lt, ast.LtE}): "ord", frozenset({ast.Gt, ast.GtE}): "ord"}
 
+def bool_struct(node, leaves):
+    if isinstance(node, ast.BoolOp):
+        return ("and" if isinstance(node.op, ast.And) else "or", [bool_struct(v, leaves) for v in node.values])
+    leaves.append(ast.dump(node)); return len(leaves) - 1
+
+def leaf_nodes(node, out):
+    if isinstance(node, ast.BoolOp):
+        for v in node.values: leaf_nodes(v, out)
+    else: out.append(node)
+
+def eval3(struct, truths, used):
+    """Python's short-circuit evaluation over recorded leaf truths; None if an unrecorded leaf is needed."""
+    if isinstance(struct, int):
+        used.add(struct); return truths[struct]
+    op, kids = struct
+    for k in kids:
+        v = eval3(k, truths, used)
+        if v is None: return None
+        if (op == "and" and not v) or (op == "or" and v): return v
+    return op == "and"
+
 def operator_swaps(old, new):
-    """If the two trees differ only in single-operator comparisons, list (line, col, family) for each
-    changed comparison; family is None when the swap is not between siblings. Otherwise return None."""
+    """If the two trees differ only in single-operator comparisons (siblings or not) and in the and/or
+    structure of conditions with identical operands, list the changes: (line, col, kind, detail).
+    kind is a comparison family ("eq"/"ord"), None for a non-sibling comparison swap, or "bool" with
+    (old structure, new structure). Otherwise return None."""
     out = []
     def same(a, b):
         if type(a) is not type(b): return False
+        if isinstance(a, ast.BoolOp):
+            la, lb = [], []
+            sa, sb = bool_struct(a, la), bool_struct(b, lb)
+            if sa == sb:   # same and/or structure: operands may differ by comparison swaps
+                na, nb = [], []
+                leaf_nodes(a, na); leaf_nodes(b, nb)
+                return len(na) == len(nb) and all(same(x, y) for x, y in zip(na, nb))
+            if la != lb: return False
+            out.append((a.lineno, a.col_offset, "bool", (sa, sb)))
+            return True
         if isinstance(a, ast.AST):
             for field in a._fields:
                 va, vb = getattr(a, field, None), getattr(b, field, None)
@@ -129,7 +162,7 @@ def operator_swaps(old, new):
                     ta, tb = [type(x) for x in va], [type(x) for x in vb]
                     if ta != tb:
                         if len(ta) != 1 or len(tb) != 1: return False
-                        out.append((a.lineno, a.col_offset, SIBLINGS.get(frozenset({ta[0], tb[0]}))))
+                        out.append((a.lineno, a.col_offset, SIBLINGS.get(frozenset({ta[0], tb[0]})), None))
                     continue
                 if not same(va, vb): return False
             return True
@@ -187,9 +220,21 @@ class Selector:
         old_tree = ast.parse(info["text"])
         if self.profiled:
             swaps = operator_swaps(old_tree, new_tree)
-            if swaps and all(fam for _, _, fam in swaps):
+            ok = swaps and all(fam in ("eq", "ord") or (fam == "bool" and f"{ln}:{col}" in info.get("bool_sites", {}))
+                               for ln, col, fam, _ in swaps)
+            if ok:
                 picked = set(readers)
-                for ln, col, fam in swaps:
+                for ln, col, fam, detail in swaps:
+                    if fam == "bool":
+                        old_s, new_s = detail; ts = set()
+                        for truths, sid_ in info["bool_sites"][f"{ln}:{col}"]:
+                            u_old, u_new = set(), set()
+                            r_old = eval3(old_s, truths, u_old); r_new = eval3(new_s, truths, u_new)
+                            if r_new is None or bool(r_new) != bool(r_old) or u_new != u_old:
+                                if sid_ == -1: why.append(f"{path}:{ln} and/or change, hazard at import -> all"); return self.ALL
+                                ts |= set(self.sets[sid_])
+                        picked |= ts; why.append(f"{path}:{ln} and/or change -> {len(ts)} tests where it could differ")
+                        continue
                     sid_ = info.get("cmp_hazard", {}).get(f"{ln}:{col}", {}).get(fam)
                     if sid_ == -1: why.append(f"{path}:{ln} operator swap, hazard at import -> all"); return self.ALL
                     ts = set(self.sets[sid_]) if sid_ is not None else set()

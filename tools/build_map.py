@@ -272,6 +272,21 @@ for fam in ("eq", "ord"):
         if rel not in files: continue
         entry = files[rel]["cmp_hazard"].setdefault(f"{ln}:{col}", {})
         entry[fam] = -1 if any(c.startswith("<") and not c.startswith("<class>") for c in ctxs) else sid(ctx_tests(ctxs))
+bools = {}
+for f in glob.glob(os.path.join(reads_dir, "valprof-*.json")):
+    for site, rows in json.load(open(f)).get("bool", {}).items():
+        for truths, ctxs in rows: bools.setdefault(site, {}).setdefault(tuple(truths), set()).update(ctxs)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import valprof
+for rel, info in files.items():
+    rw = valprof._Rewrite(rel); rw.visit(ast.parse(info["text"]))
+    info["bool_sites"] = {k: [] for k in rw.bool_sites}       # instrumented conditions
+for site, d in bools.items():
+    rel, ln, col = site.rsplit(":", 2)
+    if rel not in files: continue
+    rows = files[rel]["bool_sites"].setdefault(f"{ln}:{col}", [])
+    for truths, ctxs in d.items():
+        rows.append([list(truths), -1 if any(c.startswith("<") and not c.startswith("<class>") for c in ctxs) else sid(ctx_tests(ctxs))])
 profiled = bool(glob.glob(os.path.join(reads_dir, "valprof-*.json")))
 
 # Test files: their own tests, plus tests in files that import them (helpers, base classes).

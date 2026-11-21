@@ -63,9 +63,67 @@ def _cmp(site, op, a, b):
 
 builtins.__bb_cmp__ = _cmp
 
+_bools = {}   # site -> {truth tuple: set of contexts}; a tuple has True/False per leaf, None = not evaluated
+
+def _eval(struct, leaves, truths):
+    """Evaluate a BoolOp tree with Python's short-circuit semantics, recording each leaf's truth."""
+    if isinstance(struct, int):
+        v = leaves[struct](); truths[struct] = bool(v); return v
+    op, kids = struct
+    v = None
+    for k in kids:
+        v = _eval(k, leaves, truths)
+        if (op == "and" and not v) or (op == "or" and v): return v
+    return v
+
+def _bool(site, struct, *leaves):
+    truths = [None] * len(leaves)
+    v = _eval(struct, leaves, truths)
+    d = _bools.setdefault(site, {}).setdefault(tuple(truths), set())
+    d.add(_ctx[0])
+    return v
+
+builtins.__bb_bool__ = _bool
+
+
+def _flatten(node, leaves):
+    """BoolOp tree -> nested (op, [children]) with leaf indices; leaves collected in order."""
+    if isinstance(node, ast.BoolOp):
+        return ("and" if isinstance(node.op, ast.And) else "or", [_flatten(v, leaves) for v in node.values])
+    leaves.append(node); return len(leaves) - 1
+
+def _lambda_safe(node):
+    """Leaves become lambdas: skip anything whose meaning a lambda would change."""
+    for n in ast.walk(node):
+        if isinstance(n, (ast.NamedExpr, ast.Yield, ast.YieldFrom, ast.Await)): return False
+        if isinstance(n, ast.Name) and n.id in ("super", "locals", "vars", "__class__"): return False
+    return True
+
+def _struct_ast(struct):
+    if isinstance(struct, int): return ast.Constant(struct)
+    return ast.Tuple([ast.Constant(struct[0]), ast.Tuple([_struct_ast(k) for k in struct[1]], ast.Load())], ast.Load())
 
 class _Rewrite(ast.NodeTransformer):
-    def __init__(self, rel): self.rel = rel
+    def __init__(self, rel): self.rel = rel; self.depth = 0; self.bool_sites = []
+    def visit_FunctionDef(self, node):
+        self.depth += 1; self.generic_visit(node); self.depth -= 1; return node
+    visit_AsyncFunctionDef = visit_FunctionDef
+    def _wrap_test(self, test):
+        if self.depth == 0 or not isinstance(test, ast.BoolOp) or not _lambda_safe(test): return self.visit(test)
+        leaves = []; struct = _flatten(test, leaves)
+        site = f"{self.rel}:{test.lineno}:{test.col_offset}"
+        self.bool_sites.append(f"{test.lineno}:{test.col_offset}")
+        lams = [ast.Lambda(ast.arguments([], [], None, [], [], None, []), self.visit(leaf)) for leaf in leaves]
+        call = ast.Call(ast.Name("__bb_bool__", ast.Load()), [ast.Constant(site), _struct_ast(struct)] + lams, [])
+        return ast.copy_location(call, test)
+    def visit_If(self, node):
+        node.test = self._wrap_test(node.test); node.body = [self.visit(n) for n in node.body]
+        node.orelse = [self.visit(n) for n in node.orelse]; return node
+    def visit_While(self, node):
+        node.test = self._wrap_test(node.test); node.body = [self.visit(n) for n in node.body]
+        node.orelse = [self.visit(n) for n in node.orelse]; return node
+    def visit_IfExp(self, node):
+        node.test = self._wrap_test(node.test); node.body = self.visit(node.body); node.orelse = self.visit(node.orelse); return node
     def visit_Compare(self, node):
         self.generic_visit(node)
         if len(node.ops) != 1: return node
@@ -168,4 +226,5 @@ def pytest_collection_finish(session):
 def pytest_sessionfinish(session):
     out = os.environ.get("BR_READS_DIR", "/tmp")
     with open(os.path.join(out, f"valprof-{os.getpid()}.json"), "w") as f:
-        json.dump({"eq": {k: sorted(v) for k, v in _eq.items()}, "ord": {k: sorted(v) for k, v in _ord.items()}}, f)
+        json.dump({"eq": {k: sorted(v) for k, v in _eq.items()}, "ord": {k: sorted(v) for k, v in _ord.items()},
+                   "bool": {k: [[list(t), sorted(c)] for t, c in d.items()] for k, d in _bools.items()}}, f)

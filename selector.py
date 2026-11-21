@@ -56,18 +56,120 @@ def apply(old_text, hunks):
     out.extend(old[i:])
     return "\n".join(out)
 
+CONTINUATION = {"elif", "else", "except", "finally", "case"}
+BLOCK = {"if", "for", "while", "try", "with", "match", "async", "def", "class", "lambda"}
+
+def first_word(l):
+    m = re.match(r"\s*([A-Za-z_]+)", l)
+    return m.group(1) if m else ""
+
+def control_flow_change(hunks):
+    """Does this edit change which code runs, rather than what one statement does?"""
+    for _, body in hunks:
+        removed = [l for op, l in body if op == "-"]; added = [l for op, l in body if op == "+"]
+        words_r = [first_word(l) for l in removed]; words_a = [first_word(l) for l in added]
+        if any(w in CONTINUATION for w in words_r + words_a): return True
+        if sorted(w for w in words_r if w in BLOCK) != sorted(w for w in words_a if w in BLOCK): return True
+        indent = lambda l: len(l) - len(l.lstrip())
+        if sorted(indent(l) for l in removed if l.strip()) != sorted(indent(l) for l in added if l.strip()):
+            if added or removed: return True
+    return False
+
 def changed_old_lines(hunks):
-    """Old-file lines removed or edited, and insertion points (old line before which new lines go)."""
+    """Old-file lines removed or edited, and insertion points (old line before which new lines go).
+    A run of k removed lines followed by j added lines is an edit of those k lines; only when j > k
+    do the extra added lines count as an insertion, right after the last removed line."""
     removed, inserted_before = set(), set()
     for start, body in hunks:
-        ln = start
-        for op, _ in body:
-            if op == " ": ln += 1
-            elif op == "-": removed.add(ln); ln += 1
-            else: inserted_before.add(ln)
+        ln = start; i = 0
+        while i < len(body):
+            op = body[i][0]
+            if op == " ":
+                ln += 1; i += 1; continue
+            run_minus = run_plus = 0
+            while i < len(body) and body[i][0] == "-": removed.add(ln); ln += 1; run_minus += 1; i += 1
+            while i < len(body) and body[i][0] == "+": run_plus += 1; i += 1
+            if run_plus > run_minus: inserted_before.add(ln)
     return removed, inserted_before
 
 # ---------- deciding tests ----------
+def scalar_literal(v):
+    if isinstance(v, ast.Constant): return True
+    if isinstance(v, ast.UnaryOp) and isinstance(v.operand, ast.Constant): return True
+    if isinstance(v, ast.Tuple): return all(scalar_literal(e) for e in v.elts)
+    return False
+
+def new_scalar_ok(tree, cls, name):
+    """In the patched file, is cls.name still assigned a scalar literal (or no longer assigned)?"""
+    body = tree.body
+    for part in cls.split("."):
+        nxt = [n for n in body if isinstance(n, ast.ClassDef) and n.name == part]
+        if len(nxt) != 1: return False
+        body = nxt[0].body
+    found = []
+    for st in body:
+        tg = st.targets if isinstance(st, ast.Assign) else [st.target] if isinstance(st, (ast.AnnAssign, ast.AugAssign)) else []
+        if any(isinstance(t, ast.Name) and t.id == name for t in tg): found.append(st)
+    if not found: return True
+    return len(found) == 1 and isinstance(found[0], (ast.Assign, ast.AnnAssign)) and found[0].value is not None and scalar_literal(found[0].value)
+
+SIBLINGS = {frozenset({ast.Is, ast.Eq}): "eq", frozenset({ast.IsNot, ast.NotEq}): "eq",
+            frozenset({ast.Lt, ast.LtE}): "ord", frozenset({ast.Gt, ast.GtE}): "ord"}
+
+def bool_struct(node, leaves):
+    if isinstance(node, ast.BoolOp):
+        return ("and" if isinstance(node.op, ast.And) else "or", [bool_struct(v, leaves) for v in node.values])
+    leaves.append(ast.dump(node)); return len(leaves) - 1
+
+def leaf_nodes(node, out):
+    if isinstance(node, ast.BoolOp):
+        for v in node.values: leaf_nodes(v, out)
+    else: out.append(node)
+
+def eval3(struct, truths, used):
+    """Python's short-circuit evaluation over recorded leaf truths; None if an unrecorded leaf is needed."""
+    if isinstance(struct, int):
+        used.add(struct); return truths[struct]
+    op, kids = struct
+    for k in kids:
+        v = eval3(k, truths, used)
+        if v is None: return None
+        if (op == "and" and not v) or (op == "or" and v): return v
+    return op == "and"
+
+def operator_swaps(old, new):
+    """If the two trees differ only in single-operator comparisons (siblings or not) and in the and/or
+    structure of conditions with identical operands, list the changes: (line, col, kind, detail).
+    kind is a comparison family ("eq"/"ord"), None for a non-sibling comparison swap, or "bool" with
+    (old structure, new structure). Otherwise return None."""
+    out = []
+    def same(a, b):
+        if type(a) is not type(b): return False
+        if isinstance(a, ast.BoolOp):
+            la, lb = [], []
+            sa, sb = bool_struct(a, la), bool_struct(b, lb)
+            if sa == sb:   # same and/or structure: operands may differ by comparison swaps
+                na, nb = [], []
+                leaf_nodes(a, na); leaf_nodes(b, nb)
+                return len(na) == len(nb) and all(same(x, y) for x, y in zip(na, nb))
+            if la != lb: return False
+            out.append((a.lineno, a.col_offset, "bool", (sa, sb)))
+            return True
+        if isinstance(a, ast.AST):
+            for field in a._fields:
+                va, vb = getattr(a, field, None), getattr(b, field, None)
+                if isinstance(a, ast.Compare) and field == "ops":
+                    ta, tb = [type(x) for x in va], [type(x) for x in vb]
+                    if ta != tb:
+                        if len(ta) != 1 or len(tb) != 1: return False
+                        out.append((a.lineno, a.col_offset, SIBLINGS.get(frozenset({ta[0], tb[0]})), None))
+                    continue
+                if not same(va, vb): return False
+            return True
+        if isinstance(a, list): return len(a) == len(b) and all(same(x, y) for x, y in zip(a, b))
+        return a == b
+    return out if same(old, new) else None
+
 GLOBAL_CLASS_ATTRS = {"_sql_names"}   # read at import into registries shared by every dialect
 
 def registry_change(path, old, new):
@@ -102,6 +204,7 @@ class Selector:
         m = json.loads(gzip.decompress(MAP.read_bytes()))
         self.sets = m["sets"]; self.files = m["files"]; self.reads = m["reads"]
         self.test_files = m["test_files"]; self.ALL = set(self.sets[m["all"]])
+        self.profiled = m.get("profiled", False)
 
     def py_source(self, path, hunks, why):
         info = self.files[path]
@@ -114,12 +217,47 @@ class Selector:
         if ast.dump(new_tree) == info["ast"]:
             why.append(f"{path}: same AST (comment/whitespace) -> {len(readers)} source readers"); return readers
         mod_users = set(self.sets[info["mod_users"]])
-        registry = registry_change(path, ast.parse(info["text"]), new_tree)
+        old_tree = ast.parse(info["text"])
+        if self.profiled:
+            swaps = operator_swaps(old_tree, new_tree)
+            ok = swaps and all(fam in ("eq", "ord") or (fam == "bool" and f"{ln}:{col}" in info.get("bool_sites", {}))
+                               for ln, col, fam, _ in swaps)
+            if ok:
+                picked = set(readers)
+                for ln, col, fam, detail in swaps:
+                    if fam == "bool":
+                        old_s, new_s = detail; ts = set()
+                        for truths, sid_ in info["bool_sites"][f"{ln}:{col}"]:
+                            u_old, u_new = set(), set()
+                            r_old = eval3(old_s, truths, u_old); r_new = eval3(new_s, truths, u_new)
+                            if r_new is None or bool(r_new) != bool(r_old) or u_new != u_old:
+                                if sid_ == -1: why.append(f"{path}:{ln} and/or change, hazard at import -> all"); return self.ALL
+                                ts |= set(self.sets[sid_])
+                        picked |= ts; why.append(f"{path}:{ln} and/or change -> {len(ts)} tests where it could differ")
+                        continue
+                    sid_ = info.get("cmp_hazard", {}).get(f"{ln}:{col}", {}).get(fam)
+                    if sid_ == -1: why.append(f"{path}:{ln} operator swap, hazard at import -> all"); return self.ALL
+                    ts = set(self.sets[sid_]) if sid_ is not None else set()
+                    picked |= ts; why.append(f"{path}:{ln} {fam} operator swap -> {len(ts)} tests where it could differ")
+                return picked
+        registry = registry_change(path, old_tree, new_tree)
         spans = info["spans"]; starts = [s[0] for s in spans]
         lines, users = info["lines"], set(self.sets[info["users"]])
         import_lines = set(info.get("import_lines", []))
         removed, inserted = changed_old_lines(hunks)
         picked = set()
+        reroutes = control_flow_change(hunks)
+
+        def entered(ln):
+            """Tests that entered the innermost function around line ln."""
+            best = None
+            for a, b in info["funcs"]:
+                if a - 1 <= ln <= b + 1 and (best is None or b - a < best[1] - best[0]): best = (a, b)
+            if best is None: return None
+            ts = set()
+            for x in range(best[0], best[1] + 1):
+                if str(x) in lines: ts |= set(self.sets[lines[str(x)]])
+            return ts
 
         def stmt_at(ln):
             k = bisect.bisect_right(starts, ln) - 1
@@ -130,8 +268,34 @@ class Selector:
                 k -= 1
             return None
 
-        def tests_for_stmt(st):
+        def in_lambda(ln):
+            """Tests that called the innermost lambda whose body holds ln, if ln is runtime-only code."""
+            if ln in import_lines: return None
+            best = None
+            for a, b in info.get("lambdas", []):
+                if a <= ln <= b and (best is None or b - a < best[1] - best[0]): best = (a, b)
+            if best is None: return None
+            ts = set()
+            for x in range(best[0], best[1] + 1):
+                if str(x) in lines: ts |= set(self.sets[lines[str(x)]])
+            return ts or None   # no line of the lambda ever ran: coverage may be incomplete, use the file level
+
+        def scalar_attr(ln):
+            """Readers of a scalar class attribute whose assignment holds ln, if the patch keeps it a
+            scalar literal (or removes it). None if ln is not such an assignment."""
+            for a, b, cls, name, set_id in info.get("scalar_attrs", []):
+                if a <= ln <= b:
+                    if new_scalar_ok(new_tree, cls, name): return set(self.sets[set_id]), f"{cls}.{name}"
+                    return None
+            return None
+
+        def tests_for_stmt(st, ln=None):
             s, e, scope = st
+            if scope == "m" and ln is not None and not registry:
+                lam = in_lambda(ln)
+                if lam is not None: return lam, "lambda body"
+                sa = scalar_attr(ln)
+                if sa is not None: return sa[0], f"reads of {sa[1]}"
             if scope == "m":   # runs at import: who depends on it is who uses this module's objects
                 if registry: return self.ALL, f"module-level, {registry}"
                 return mod_users, "module-level"
@@ -146,16 +310,23 @@ class Selector:
             st = stmt_at(ln)
             if st is None:   # blank/comment line outside any statement: look at neighbours
                 inserted.add(ln); continue
-            ts, kind = tests_for_stmt(st); picked |= ts
+            ts, kind = tests_for_stmt(st, ln); picked |= ts
             if kind != "function": why.append(f"{path}:{ln} {kind} -> {len(ts)}")
         for ln in sorted(inserted):
             for nb in (ln - 1, ln):   # statements just above and at the insertion point
                 st = stmt_at(nb)
                 if st is None: continue
-                ts, kind = tests_for_stmt(st); picked |= ts
+                ts, kind = tests_for_stmt(st, nb); picked |= ts
             if stmt_at(ln - 1) is None and stmt_at(ln) is None:
                 if registry: picked |= self.ALL; why.append(f"{path}:{ln} insert, {registry} -> all")
                 else: picked |= mod_users; why.append(f"{path}:{ln} insert at module level -> {len(mod_users)}")
+        if reroutes:   # control flow changed: anyone who entered the function may take a new path
+            for ln in sorted(removed | inserted):
+                st = stmt_at(ln) or stmt_at(ln - 1)
+                if st is not None and st[2] == "m": continue   # module level: handled above
+                ts = entered(ln)
+                if ts is None: picked |= mod_users; why.append(f"{path}:{ln} control flow outside a function -> {len(mod_users)}")
+                else: picked |= ts; why.append(f"{path}:{ln} control flow -> {len(ts)} who entered the function")
         why.append(f"{path}: {len(picked)} tests")
         return picked | readers
 

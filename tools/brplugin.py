@@ -48,6 +48,7 @@ def pytest_sessionfinish(session):
         mods[ctx] = sorted(files)
     with _orig(os.path.join(out, f"inst-{os.getpid()}.json"), "w") as f:
         json.dump(mods, f)
+    _write_attr_reads()
 
 
 # --- run process pools in-process so coverage sees the work done "in" them ---
@@ -92,6 +93,8 @@ def pytest_sessionstart(session):
         except Exception:
             pass
     _install_instance_recorder()
+    _install_attr_recorders()
+    _install_cache_misses()
 
 
 # --- which classes each test instantiates (dialects, parsers, generators, expressions...) ---
@@ -114,3 +117,81 @@ def _install_instance_recorder():
             _types.setdefault(_current[0], set()).add(type(self))
             return __orig(self, *a, **k)
         base.__init__ = wrapped
+
+
+# --- scalar class-attribute reads: which tests read (defining class, name) ---
+# Installed after every sqlglot module is imported, as non-data descriptors that return the
+# original value unchanged. The map builder keeps only attributes that pass its static checks.
+_attr_reads = {}
+_installed = []   # (class, name, descriptor)
+
+def _is_scalar(v):
+    if v is None or isinstance(v, (bool, int, float, str)): return True
+    return isinstance(v, tuple) and all(_is_scalar(x) for x in v)
+
+class _ReadRecorder:
+    __slots__ = ("value", "key")
+    def __init__(self, value, key): self.value = value; self.key = key
+    def __get__(self, obj, objtype=None):
+        _attr_reads.setdefault(_current[0], set()).add(self.key)
+        return self.value
+
+def _install_attr_recorders():
+    import inspect as _inspect
+    seen = set()
+    for modname, mod in list(sys.modules.items()):
+        if not (modname == "sqlglot" or modname.startswith("sqlglot.")): continue
+        for obj in list(vars(mod).values()):
+            todo = [obj]
+            while todo:
+                cls = todo.pop()
+                if not isinstance(cls, type) or cls in seen or not cls.__module__.startswith("sqlglot"): continue
+                seen.add(cls)
+                for name, val in list(vars(cls).items()):
+                    if isinstance(val, type): todo.append(val)
+                    if name.startswith("__") or not _is_scalar(val): continue
+                    key = f"{cls.__module__}:{cls.__qualname__}.{name}"
+                    d = _ReadRecorder(val, key)
+                    try: setattr(cls, name, d)
+                    except (AttributeError, TypeError): continue
+                    _installed.append((cls, name, d))
+
+def _write_attr_reads():
+    out = os.environ.get("BR_READS_DIR", "/tmp")
+    displaced = sorted(d.key for cls, name, d in _installed if vars(cls).get(name) is not d)
+    with _orig(os.path.join(out, f"attrs-{os.getpid()}.json"), "w") as f:
+        json.dump({"reads": {k: sorted(v) for k, v in _attr_reads.items()},
+                   "installed": sorted(d.key for _, _, d in _installed), "displaced": displaced}, f)
+
+
+# --- runtime caches: make every lookup a miss while building the map ---
+# sqlglot keeps per-process caches (generator._DISPATCH_CACHE) and per-object caches on schemas that
+# tests share (TestOptimizer installs one global MappingSchema). Coverage would credit the cached
+# computation only to the first test that filled the cache. With an always-miss .get(), every test
+# recomputes and is credited. Entries are still stored, so len() checks in tests see the same sizes.
+class _AlwaysMiss(dict):
+    def get(self, key, default=None):
+        return default
+
+class _NeverStore(_AlwaysMiss):
+    """Also stores nothing: for caches whose growth a test would see (test_generator_memory)."""
+    def __setitem__(self, key, value):
+        pass
+
+def _install_cache_misses():
+    import sqlglot.generator as gen
+    import sqlglot.schema as sch
+    gen._DISPATCH_CACHE = _NeverStore()
+    orig = sch.MappingSchema.__init__
+    def init(self, *a, __orig=orig, **k):
+        __orig(self, *a, **k)
+        for name in ("_find_cache", "_normalized_table_cache", "_normalized_name_cache"):
+            if isinstance(getattr(self, name, None), dict):
+                setattr(self, name, _AlwaysMiss(getattr(self, name)))
+    sch.MappingSchema.__init__ = init
+    import sqlglot   # the default global schema was created at import, before this patch
+    for obj in (getattr(sqlglot, "schema", None),):
+        if isinstance(obj, sch.MappingSchema):
+            for name in ("_find_cache", "_normalized_table_cache", "_normalized_name_cache"):
+                if isinstance(getattr(obj, name, None), dict):
+                    setattr(obj, name, _AlwaysMiss(getattr(obj, name)))

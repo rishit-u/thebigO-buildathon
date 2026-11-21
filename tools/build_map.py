@@ -83,6 +83,11 @@ for path in sorted(cov.measured_files()):
         "users": sid(users),           # every test that ran any line of this file
         "lines": lines,                # line -> set id (only lines some test ran)
         "spans": spans(tree),
+        # lambda bodies [first line, last line]: run when called, not at import
+        "lambdas": sorted([n.body.lineno, n.body.end_lineno] for n in ast.walk(tree) if isinstance(n, ast.Lambda)),
+        # function bodies [first body line, last line]: who entered a function = who ran any line in it
+        "funcs": sorted([n.body[0].lineno, n.end_lineno] for n in ast.walk(tree)
+                        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))),
         "import_lines": import_lines,  # lines run at import time: a change there affects everyone
         "ast": ast.dump(tree),
         "text": text,                  # pinned source, so patches can be applied at run time
@@ -200,6 +205,90 @@ def reach(rel, stack=()):
 for rel, info in files.items():
     info["mod_users"] = sid(reach(rel))
 
+# Scalar class attributes: which tests read (defining class, name). An attribute is kept only if
+# (a) its pinned value is an immutable scalar literal, (b) its name never appears as a read, a name or
+# a string in any statement that ran at import (aliases, merges, metaclass and __init_subclass__
+# code, __dict__ lookups by string), (c) its recorder was installed and never displaced during the
+# run, which also had identical test outcomes. Anything else keeps file-level reach.
+def scalar_literal(v):
+    if isinstance(v, ast.Constant): return True
+    if isinstance(v, ast.UnaryOp) and isinstance(v.operand, ast.Constant): return True
+    if isinstance(v, ast.Tuple): return all(scalar_literal(e) for e in v.elts)
+    return False
+import_names = set()
+for rel, info in files.items():
+    imp = set(info["import_lines"])
+    for node in ast.walk(ast.parse(info["text"])):
+        if getattr(node, "lineno", None) not in imp: continue
+        if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load): import_names.add(node.attr)
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load): import_names.add(node.id)
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str): import_names.add(node.value)
+attr_reads, installed, displaced = {}, set(), set()
+for f in glob.glob(os.path.join(reads_dir, "attrs-*.json")):
+    d = json.load(open(f)); installed |= set(d["installed"]); displaced |= set(d["displaced"])
+    for ctx, keys in d["reads"].items():
+        if ctx.startswith("<") and not ctx.startswith("<class>"): continue
+        ts = ctx_tests([ctx])
+        for k in keys: attr_reads.setdefault(k, set()).update(ts)
+file_mod = {rel: (rel[:-3].replace("/", ".")[: -len(".__init__")] if rel.endswith("__init__.py") else rel[:-3].replace("/", ".")) for rel in files}
+kept = 0
+for rel, info in files.items():
+    entries = []
+    def opaque(c):
+        """Classes whose attributes are consumed by stdlib machinery at import (dataclass defaults,
+        Enum members, NamedTuple/TypedDict fields, any class decorator): no symbol-level reads."""
+        if c.decorator_list: return True
+        names = {ast.unparse(b).split(".")[-1].split("[")[0] for b in c.bases}
+        return bool(names & {"Enum", "IntEnum", "StrEnum", "Flag", "IntFlag", "NamedTuple", "TypedDict", "AutoName"})
+    def visit(body, cls, blocked=False):
+        global kept
+        for st in body:
+            if isinstance(st, ast.ClassDef):
+                visit(st.body, (cls + "." if cls else "") + st.name, blocked or opaque(st)); continue
+            if blocked: continue
+            if cls and isinstance(st, (ast.Assign, ast.AnnAssign)) and st.value is not None:
+                tg = st.targets if isinstance(st, ast.Assign) else [st.target]
+                if len(tg) != 1 or not isinstance(tg[0], ast.Name) or tg[0].id.startswith("__"): continue
+                name = tg[0].id; key = f"{file_mod[rel]}:{cls}.{name}"
+                if not scalar_literal(st.value) or name in import_names: continue
+                if key not in installed or key in displaced: continue
+                entries.append([st.lineno, st.end_lineno, cls, name, sid(attr_reads.get(key, set()))]); kept += 1
+    visit(ast.parse(info["text"]).body, "")
+    info["scalar_attrs"] = entries
+print(f"scalar attributes with symbol-level reads: {kept}", file=sys.stderr)
+
+# Value-level facts at comparisons (tools/valprof.py): per site, the tests in which swapping the operator
+# for its sibling (is/==, is not/!=, </<=, >/>=) could change the result. -1 = it could during import or
+# outside any test, i.e. for everyone.
+hz = {"eq": {}, "ord": {}}
+for f in glob.glob(os.path.join(reads_dir, "valprof-*.json")):
+    d = json.load(open(f))
+    for fam in ("eq", "ord"):
+        for site, ctxs in d[fam].items(): hz[fam].setdefault(site, set()).update(ctxs)
+for rel, info in files.items(): info["cmp_hazard"] = {}
+for fam in ("eq", "ord"):
+    for site, ctxs in hz[fam].items():
+        rel, ln, col = site.rsplit(":", 2)
+        if rel not in files: continue
+        entry = files[rel]["cmp_hazard"].setdefault(f"{ln}:{col}", {})
+        entry[fam] = -1 if any(c.startswith("<") and not c.startswith("<class>") for c in ctxs) else sid(ctx_tests(ctxs))
+bools = {}
+for f in glob.glob(os.path.join(reads_dir, "valprof-*.json")):
+    for site, rows in json.load(open(f)).get("bool", {}).items():
+        for truths, ctxs in rows: bools.setdefault(site, {}).setdefault(tuple(truths), set()).update(ctxs)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import valprof
+for rel, info in files.items():
+    rw = valprof._Rewrite(rel); rw.visit(ast.parse(info["text"]))
+    info["bool_sites"] = {k: [] for k in rw.bool_sites}       # instrumented conditions
+for site, d in bools.items():
+    rel, ln, col = site.rsplit(":", 2)
+    if rel not in files: continue
+    rows = files[rel]["bool_sites"].setdefault(f"{ln}:{col}", [])
+    for truths, ctxs in d.items():
+        rows.append([list(truths), -1 if any(c.startswith("<") and not c.startswith("<class>") for c in ctxs) else sid(ctx_tests(ctxs))])
+profiled = bool(glob.glob(os.path.join(reads_dir, "valprof-*.json")))
+
 # Test files: their own tests, plus tests in files that import them (helpers, base classes).
 by_file = {}
 for t in T["tests"]: by_file.setdefault(t["file"], []).append(t["number"])
@@ -215,6 +304,6 @@ for p in pyfiles:
             nums |= set(by_file.get(os.path.relpath(q, src), []))
     test_files[rel] = sid(nums if nums else ALL)
 
-json.dump({"sets": sets, "all": sid(ALL), "files": files, "reads": read_map, "test_files": test_files},
+json.dump({"sets": sets, "all": sid(ALL), "profiled": profiled, "files": files, "reads": read_map, "test_files": test_files},
           open(out, "w"), separators=(",", ":"))
 print(f"{len(files)} source files, {len(sets)} unique test sets, {len(read_map)} read files, {os.path.getsize(out)/1e6:.1f} MB", file=sys.stderr)

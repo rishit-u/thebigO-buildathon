@@ -6,3 +6,4 @@ sqlglot/
 pinned/
 tpcds_pinned.json
 tpcds_spec.json
+maxnodes_pinned.json

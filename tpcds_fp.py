@@ -16,6 +16,7 @@ import enum, hashlib, json, math, pickle, sys
 def main():
     root, spec = sys.argv[1], json.load(open(sys.argv[2]))
     sys.path.insert(0, root)
+    import unittest  # noqa: F401  -- the test suite runs with UNITTEST on (expressions/core.py)
     import sqlglot
     from sqlglot import exp, parse_one, transpile
     from sqlglot.optimizer import optimize

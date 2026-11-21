@@ -164,9 +164,11 @@ for rel, tree in trees.items():
                 qual = (outer + "." if outer else "") + st.name; key = f"{rel}::{qual}"
                 n_cls += 1
                 ts = inst.get(key)
-                if ts is None or key in at_import or copied(qual) or st.decorator_list: s = -1
-                else: s = sid(ts | ref_tests(qual.split(".")[0])); n_inst += 1   # nested: via the outer class
-                entries.append([qual, st.lineno, st.end_lineno, s])
+                if ts is None or key in at_import or copied(qual) or st.decorator_list: s = -1; s5 = -1
+                else:
+                    s = sid(ts | ref_tests(qual.split(".")[0])); n_inst += 1   # nested: via the outer class
+                    s5 = sid(ts | test_refs.get(qual.split(".")[0], set()))     # objects + test-code names only
+                entries.append([qual, st.lineno, st.end_lineno, s, s5])
                 walk(st.body, qual)
     walk(tree.body, "")
     M["files"][rel]["classes"] = entries

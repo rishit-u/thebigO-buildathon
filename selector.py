@@ -470,9 +470,10 @@ GIANT_AREAS = {
 # and the patched stages give the same structural hashes as the pinned ones for every query, the
 # executor gets identical inputs and runs identical code: the test cannot change outcome.
 TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
-TPCDS_CHECK = False   # v14b: stage-fingerprint check off (it costs container CPU on every flagged commit)
+TPCDS_CHECK = True    # v16: result-level TPC-DS check (tpcds_res.py)
 APP = Path(__file__).resolve().parent
 PINNED_DIR, PINNED_FP, SPEC = APP / "pinned", APP / "tpcds_pinned.json", APP / "tpcds_spec.json"
+TPCDS_RESULTS, TPCDS_DATA = APP / "tpcds_results.json", APP / "tpcds_data"
 
 def write_tree(sel, root, changed=None):
     for rel, info in sel.files.items():
@@ -549,6 +550,11 @@ def build_pinned(sel):
     a, b = run_fp(PINNED_DIR, 300), run_fp(PINNED_DIR, 300)
     if a != b: log("pinned fingerprints are not deterministic: feature off"); return
     PINNED_FP.write_text(json.dumps(a)); log("pinned TPC-DS fingerprints:", len(a))
+    import subprocess
+    r = subprocess.run([sys.executable, "-I", str(APP / "tpcds_res.py"), str(PINNED_DIR), str(SPEC), str(PINNED_FP),
+                        "-", str(TPCDS_DATA), "--build"], capture_output=True, text=True, timeout=600)
+    if r.returncode == 0: TPCDS_RESULTS.write_text(r.stdout); log("pinned TPC-DS results:", len(json.loads(r.stdout)))
+    else: log("pinned TPC-DS results failed: check off")
     a, b = run_script("maxnodes_fp.py", PINNED_DIR, 300), run_script("maxnodes_fp.py", PINNED_DIR, 300)
     if a != b: log("pinned max_nodes results are not deterministic: check off"); return
     MAXNODES_PINNED.write_text(json.dumps(a)); log("pinned max_nodes results:", len(a))
@@ -577,7 +583,7 @@ def tpcds_checkable(sel, files):
     return True
 
 def tpcds_unaffected(sel, text):
-    if not (sel.tpcds and PINNED_FP.exists()): return False
+    if not (sel.tpcds and PINNED_FP.exists() and TPCDS_RESULTS.exists()): return False
     files = parse_patch(text)
     if not tpcds_checkable(sel, files): return False
     import shutil, tempfile
@@ -589,8 +595,13 @@ def tpcds_unaffected(sel, text):
             p.write_text(apply(sel.files[f["new"]]["text"], f["hunks"]), encoding="utf-8")
             pyc = p.parent / "__pycache__"
             for c in (pyc.glob(p.stem + ".*.pyc") if pyc.exists() else []): c.unlink()
-        res = run_fp(root, pinned=PINNED_FP)   # stops at the first differing query
-        return "mismatch" not in res and res == json.loads(PINNED_FP.read_text())
+        import subprocess
+        r = subprocess.run([sys.executable, "-I", str(APP / "tpcds_res.py"), str(root), str(SPEC), str(PINNED_FP),
+                            str(TPCDS_RESULTS), str(TPCDS_DATA)], capture_output=True, text=True, timeout=20,
+                           env={"PYTHONDONTWRITEBYTECODE": "1", "PATH": os.environ.get("PATH", "")})
+        res = json.loads(r.stdout) if r.returncode == 0 else {"ok": False, "why": r.stderr[-200:]}
+        log("  TPC-DS result check:", res)
+        return res.get("ok") is True
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

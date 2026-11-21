@@ -94,6 +94,34 @@ def copied(qual):
                 if prefix not in bases_txt: return True
     return False
 
+# Run-time references to a class by name (Foo.X, exp.Foo.from_arg_list(...), isinstance(x, Foo)):
+# tests that ran any line inside a function that mentions the name. Same-named classes share it.
+name_lines = {}
+for rel, tree in trees.items():
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)): continue
+        for st in ast.walk(fn):
+            if not isinstance(st, ast.stmt) and st is not fn: continue
+            heads = [st.body] if isinstance(st, ast.Lambda) else [v for f_, v in ast.iter_fields(st)
+                     if f_ not in ("body", "orelse", "finalbody", "handlers")]
+            for h in heads:   # the statement's own expressions; nested statements are visited themselves
+                for x in (h if isinstance(h, list) else [h]):
+                    if not isinstance(x, ast.AST): continue
+                    for n in ast.walk(x):
+                        nm = n.id if isinstance(n, ast.Name) else n.attr if isinstance(n, ast.Attribute) else None
+                        if nm and nm[:1].isupper():   # credited to every line of the statement
+                            for ln in range(st.lineno, (st.end_lineno or st.lineno) + 1):
+                                name_lines.setdefault(nm, set()).add((rel, ln))
+ref_cache = {}
+def ref_tests(name):
+    if name not in ref_cache:
+        ts = set()
+        for rel, ln in name_lines.get(name, ()):
+            k = M["files"][rel]["lines"].get(str(ln))
+            if k is not None: ts.update(sets[k])
+        ref_cache[name] = ts
+    return ref_cache[name]
+
 n_cls = n_inst = 0
 for rel, tree in trees.items():
     entries = []
@@ -105,7 +133,7 @@ for rel, tree in trees.items():
                 n_cls += 1
                 ts = inst.get(key)
                 if ts is None or key in at_import or copied(qual) or st.decorator_list: s = -1
-                else: s = sid(ts); n_inst += 1
+                else: s = sid(ts | ref_tests(qual.split(".")[0])); n_inst += 1   # nested: via the outer class
                 entries.append([qual, st.lineno, st.end_lineno, s])
                 walk(st.body, qual)
     walk(tree.body, "")

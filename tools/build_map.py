@@ -19,11 +19,22 @@ def sid(nums):
         set_ids[key] = len(sets); sets.append(list(key))
     return set_ids[key]
 
+by_class = {}
+for t in T["tests"]:
+    by_class.setdefault(t["id"].rsplit("::", 1)[0], set()).add(t["number"])
+
 def ctx_tests(ctxs):
+    """Coverage/read contexts -> test numbers. Setup-phase work (setUpClass etc.) is shared
+    by the whole class, so it counts for every test in that class."""
     out = set()
     for c in ctxs:
-        nodeid = c.split("|")[0]
-        if nodeid in num: out.add(num[nodeid])
+        nodeid, _, phase = c.partition("|")
+        if nodeid.startswith("<class>"):
+            out |= by_class.get(nodeid[len("<class>"):], set())
+        elif phase == "setup" or phase == "teardown":
+            out |= by_class.get(nodeid.rsplit("::", 1)[0], set())
+        elif nodeid in num:
+            out.add(num[nodeid])
     return out
 
 def spans(tree):
@@ -64,6 +75,7 @@ for path in sorted(cov.measured_files()):
     cbl = cov.contexts_by_lineno(path)
     users = set()
     lines = {}
+    import_lines = sorted(ln for ln, ctxs in cbl.items() if "" in ctxs)  # ran while importing
     for ln, ctxs in cbl.items():
         ts = ctx_tests(ctxs); users |= ts
         if ts: lines[str(ln)] = sid(ts)
@@ -71,6 +83,7 @@ for path in sorted(cov.measured_files()):
         "users": sid(users),           # every test that ran any line of this file
         "lines": lines,                # line -> set id (only lines some test ran)
         "spans": spans(tree),
+        "import_lines": import_lines,  # lines run at import time: a change there affects everyone
         "ast": ast.dump(tree),
         "text": text,                  # pinned source, so patches can be applied at run time         # compared with the patched file's AST
     }
@@ -82,7 +95,7 @@ for f in glob.glob(os.path.join(reads_dir, "*.json")):
         for p in v: reads.setdefault(p, set()).add(k)
 read_map = {}
 for p, ks in reads.items():
-    if any(k.startswith("<") for k in ks): read_map[p] = sid(ALL)   # read at collection: affects everyone
+    if any(k.startswith("<") and not k.startswith("<class>") for k in ks): read_map[p] = sid(ALL)   # read at collection: affects everyone
     else: read_map[p] = sid(ctx_tests(ks))
 
 # Test files: their own tests, plus tests in files that import them (helpers, base classes).

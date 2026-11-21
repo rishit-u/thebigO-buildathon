@@ -85,6 +85,7 @@ class Selector:
             why.append(f"{path}: same AST (comment/whitespace) -> none"); return set()
         spans = info["spans"]; starts = [s[0] for s in spans]
         lines, users = info["lines"], set(self.sets[info["users"]])
+        import_lines = set(info.get("import_lines", []))
         removed, inserted = changed_old_lines(hunks)
         picked = set()
 
@@ -101,6 +102,8 @@ class Selector:
             s, e, scope = st
             if scope == "m":   # runs at import: coverage only credits the first importer,
                 return self.ALL, "module-level"   # and class attributes are read by code elsewhere
+            if any(ln in import_lines for ln in range(s, e + 1)):
+                return self.ALL, "runs at import"   # e.g. metaclasses, factories called in class bodies
             ts = set()
             for ln in range(s, e + 1):
                 if str(ln) in lines: ts |= set(self.sets[lines[str(ln)]])
@@ -111,7 +114,7 @@ class Selector:
             if st is None:   # blank/comment line outside any statement: look at neighbours
                 inserted.add(ln); continue
             ts, kind = tests_for_stmt(st); picked |= ts
-            if kind == "module-level": why.append(f"{path}:{ln} module-level -> all")
+            if kind != "function": why.append(f"{path}:{ln} {kind} -> all")
         for ln in sorted(inserted):
             for nb in (ln - 1, ln):   # statements just above and at the insertion point
                 st = stmt_at(nb)

@@ -23,6 +23,14 @@ def pytest_runtest_protocol(item, nextitem):
     _current[0] = item.nodeid
     yield
     _current[0] = "<between>"
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_setup(item):
+    # setUpClass / setUpModule run inside the first test's setup and are shared by the
+    # whole class, so credit what happens here to the class ("<class>" + its node id).
+    _current[0] = "<class>" + item.nodeid.rsplit("::", 1)[0]
+    yield
+    _current[0] = item.nodeid
 def pytest_sessionfinish(session):
     out = os.environ.get("BR_READS_DIR", "/tmp")
     with _orig(os.path.join(out, f"reads-{os.getpid()}.json"), "w") as f:
@@ -56,3 +64,17 @@ def pytest_collection_finish(session):
     for name, mod in list(_sys.modules.items()):
         if name.startswith("tests") and hasattr(mod, "ProcessPoolExecutor"):
             mod.ProcessPoolExecutor = InlineExecutor
+
+
+# --- import every sqlglot module before the first test, so code that runs at
+# import time is recorded outside any test (context "") instead of being
+# credited to whichever test happened to import the module first ---
+def pytest_sessionstart(session):
+    import importlib, pkgutil, sqlglot
+    for info in pkgutil.walk_packages(sqlglot.__path__, prefix="sqlglot."):
+        if info.name.endswith("__main__"):
+            continue
+        try:
+            importlib.import_module(info.name)
+        except Exception:
+            pass

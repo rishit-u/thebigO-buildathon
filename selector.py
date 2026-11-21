@@ -521,7 +521,8 @@ def tpcds_unaffected(sel, text):
         shutil.rmtree(root, ignore_errors=True)
 
 def aggressive(sel, picked, paths, num_of, text=None):
-    if len(picked) >= len(sel.ALL) - 1:   # run-everything fallback: tests that ran the changed files
+    was_all = len(picked) >= len(sel.ALL) - 1
+    if was_all:   # run-everything fallback: tests that ran the changed files
         narrowed = set()
         for p in paths:
             if p in sel.files: narrowed |= set(sel.sets[sel.files[p]["users"]])
@@ -529,7 +530,9 @@ def aggressive(sel, picked, paths, num_of, text=None):
             elif p in sel.test_files: narrowed |= set(sel.sets[sel.test_files[p]])
             else: return picked            # unknown kind of file: keep everything
         picked = narrowed
-    broad = len(picked) * 5 > len(sel.ALL) * 4   # a very broad edit (>80% of tests): keep the giants too
+    # a very broad edit (>80% of tests) keeps the giants too, except after a run-everything fallback
+    # (registry changes such as a new class): there the giants follow their code areas (v14p probe)
+    broad = not was_all and len(picked) * 5 > len(sel.ALL) * 4
     for tid, areas in GIANT_AREAS.items():
         n = num_of.get(tid)
         if n in picked and not broad and not any(p.startswith(a) for p in paths for a in areas):

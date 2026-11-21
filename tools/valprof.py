@@ -85,6 +85,67 @@ def _bool(site, struct, *leaves):
 
 builtins.__bb_bool__ = _bool
 
+import dis as _dis
+_MERGE_OPS = {_dis.opmap.get("DICT_UPDATE"), _dis.opmap.get("DICT_MERGE")} - {None}
+_dict_reads = {}     # site -> {key repr: set of contexts} (value read of one key)
+_dict_all = {}       # site -> set of contexts (all values read: items/values/copy/|)
+_dict_derived = {}   # site -> set of key reprs ("*" = all) read at import outside a dict merge
+_dict_flags = {}     # site -> set of {"mutated", "opaque"}
+_dict_instances = [] # every recording dict, for identity grouping at the end
+
+def _krepr(k):
+    if isinstance(k, type): return k.__name__
+    if isinstance(k, enum.Enum): return f"{type(k).__name__}.{k.name}"
+    if isinstance(k, (str, int, float, bool, type(None))): return repr(k)
+    return None
+
+def _importing(): return _ctx[0] == "<collect>"
+
+def _merge_caller():
+    try:
+        f = sys._getframe(3)    # _merge_caller <- _value_read <- __getitem__/get <- caller
+        return f.f_code.co_code[f.f_lasti] in _MERGE_OPS
+    except Exception:
+        return False
+
+class _RecDict(dict):
+    def _value_read(self, k):
+        r = _krepr(k)
+        if r is None: _dict_flags.setdefault(self._bb_site, set()).add("opaque"); return
+        if _importing():
+            if not _merge_caller(): _dict_derived.setdefault(self._bb_site, set()).add(r)
+            return
+        _dict_reads.setdefault(self._bb_site, {}).setdefault(r, set()).add(_ctx[0])
+    def _all_read(self):
+        if _importing(): _dict_derived.setdefault(self._bb_site, set()).add("*")
+        else: _dict_all.setdefault(self._bb_site, set()).add(_ctx[0])
+    def _mutated(self):
+        if not _importing(): _dict_flags.setdefault(self._bb_site, set()).add("mutated")
+    def __getitem__(self, k):
+        self._value_read(k); return dict.__getitem__(self, k)
+    def get(self, k, default=None):
+        self._value_read(k); return dict.get(self, k, default)
+    def __iter__(self): return dict.__iter__(self)          # forces the slow path for {**d} and dict(d)
+    def keys(self): return dict.keys(self)
+    def items(self): self._all_read(); return dict.items(self)
+    def values(self): self._all_read(); return dict.values(self)
+    def copy(self): self._all_read(); return dict.copy(self)
+    def __or__(self, other): self._all_read(); return dict.__or__(self, other)
+    def __ror__(self, other): self._all_read(); return dict.__ror__(self, other)
+    def __setitem__(self, k, v): self._mutated(); dict.__setitem__(self, k, v)
+    def __delitem__(self, k): self._mutated(); dict.__delitem__(self, k)
+    def pop(self, *a): self._mutated(); return dict.pop(self, *a)
+    def popitem(self): self._mutated(); return dict.popitem(self)
+    def setdefault(self, *a): self._mutated(); return dict.setdefault(self, *a)
+    def update(self, *a, **k): self._mutated(); return dict.update(self, *a, **k)
+    def clear(self): self._mutated(); return dict.clear(self)
+    def __reduce__(self): return (dict, (dict(dict.items(self)),))   # pickles as a plain dict
+
+def _mkdict(site, d):
+    r = _RecDict(d); r._bb_site = site; _dict_instances.append(r); return r
+
+builtins.__bb_dict__ = _mkdict
+
 
 def _flatten(node, leaves):
     """BoolOp tree -> nested (op, [children]) with leaf indices; leaves collected in order."""
@@ -104,9 +165,20 @@ def _struct_ast(struct):
     return ast.Tuple([ast.Constant(struct[0]), ast.Tuple([_struct_ast(k) for k in struct[1]], ast.Load())], ast.Load())
 
 class _Rewrite(ast.NodeTransformer):
-    def __init__(self, rel): self.rel = rel; self.depth = 0; self.bool_sites = []
+    def __init__(self, rel): self.rel = rel; self.depth = 0; self.bool_sites = []; self.dict_sites = []
     def visit_FunctionDef(self, node):
         self.depth += 1; self.generic_visit(node); self.depth -= 1; return node
+    def visit_ClassDef(self, node):
+        self.generic_visit(node)
+        if self.depth == 0:
+            for st in node.body:
+                if isinstance(st, (ast.Assign, ast.AnnAssign)) and isinstance(st.value, ast.Dict):
+                    tg = st.targets if isinstance(st, ast.Assign) else [st.target]
+                    if len(tg) == 1 and isinstance(tg[0], ast.Name):
+                        site = f"{self.rel}:{st.lineno}"
+                        self.dict_sites.append(st.lineno)
+                        st.value = ast.copy_location(ast.Call(ast.Name("__bb_dict__", ast.Load()), [ast.Constant(site), st.value], []), st.value)
+        return node
     visit_AsyncFunctionDef = visit_FunctionDef
     def _wrap_test(self, test):
         if self.depth == 0 or not isinstance(test, ast.BoolOp) or not _lambda_safe(test): return self.visit(test)
@@ -223,8 +295,22 @@ def pytest_collection_finish(session):
             if isinstance(getattr(obj, n, None), dict): setattr(obj, n, _AlwaysMiss(getattr(obj, n)))
 
 
+def _identity_groups():
+    """Entries that hold the very same value object (copied by merges): [[site, key repr], ...]."""
+    by_id = {}
+    for d in _dict_instances:
+        for k, v in dict.items(d):
+            r = _krepr(k)
+            if r is not None: by_id.setdefault((id(v), r), set()).add((d._bb_site, r))
+    return [sorted(map(list, g)) for g in by_id.values() if len(g) > 1]
+
 def pytest_sessionfinish(session):
     out = os.environ.get("BR_READS_DIR", "/tmp")
     with open(os.path.join(out, f"valprof-{os.getpid()}.json"), "w") as f:
         json.dump({"eq": {k: sorted(v) for k, v in _eq.items()}, "ord": {k: sorted(v) for k, v in _ord.items()},
-                   "bool": {k: [[list(t), sorted(c)] for t, c in d.items()] for k, d in _bools.items()}}, f)
+                   "bool": {k: [[list(t), sorted(c)] for t, c in d.items()] for k, d in _bools.items()},
+                   "dict_reads": {s_: {k: sorted(c) for k, c in d.items()} for s_, d in _dict_reads.items()},
+                   "dict_all": {s_: sorted(c) for s_, c in _dict_all.items()},
+                   "dict_derived": {s_: sorted(v) for s_, v in _dict_derived.items()},
+                   "dict_flags": {s_: sorted(v) for s_, v in _dict_flags.items()},
+                   "dict_groups": _identity_groups()}, f)

@@ -22,7 +22,18 @@ ORD_OPS = {ast.Lt: 4, ast.LtE: 5, ast.Gt: 6, ast.GtE: 7}
 
 
 def _plain(x):
-    return type(x).__eq__ is object.__eq__
+    """Equality and inequality are both plain identity for this object's class."""
+    t = type(x)
+    return t.__eq__ is object.__eq__ and t.__ne__ is object.__ne__
+
+_SAFE_ENUM_EQ = {object.__eq__, str.__eq__, int.__eq__}
+_SAFE_ENUM_NE = {object.__ne__, str.__ne__, int.__ne__}
+
+def _enum_identity(a, b):
+    """Two members of the same Enum class whose equality is not overridden: == and != are identity."""
+    t = type(a)
+    return (isinstance(a, enum.Enum) and t is type(b)
+            and t.__eq__ in _SAFE_ENUM_EQ and t.__ne__ in _SAFE_ENUM_NE)
 
 
 def _scalar_tuple(x):
@@ -34,12 +45,12 @@ def _cmp(site, op, a, b):
         if a is None or b is None:
             other = b if a is None else a
             safe = other is None or _plain(other)
-        elif isinstance(a, enum.Enum) and type(a) is type(b):
+        elif _enum_identity(a, b):
             safe = True
         elif _plain(a) and _plain(b):
             safe = True
         elif type(a) in SCALARS and type(b) in SCALARS:
-            safe = (a is b) == (a == b)
+            safe = (a is b) == (a == b) and (a is not b) == (a != b)
         else:
             safe = False
         if not safe:
@@ -65,22 +76,30 @@ builtins.__bb_cmp__ = _cmp
 
 _bools = {}   # site -> {truth tuple: set of contexts}; a tuple has True/False per leaf, None = not evaluated
 
-def _eval(struct, leaves, truths):
-    """Evaluate a BoolOp tree with Python's short-circuit semantics, recording each leaf's truth."""
+_PLAIN_BOOL = {object, type(None), bool, int, float, str, bytes, tuple, list, dict, set, frozenset}
+
+def _eval(struct, leaves, truths, flags):
+    """Evaluate a BoolOp tree with Python's short-circuit semantics, calling bool() once per evaluated
+    leaf (as the and/or itself would) and recording it. A leaf whose class defines its own truthiness
+    is flagged, since an extra bool() call by the enclosing `if` could observe state."""
     if isinstance(struct, int):
-        v = leaves[struct](); truths[struct] = bool(v); return v
+        v = leaves[struct](); t = type(v)
+        if t not in _PLAIN_BOOL and ("__bool__" in vars(t) or "__len__" in vars(t) or
+                                     any("__bool__" in vars(c) or "__len__" in vars(c) for c in t.__mro__[1:-1])):
+            flags.append(struct)
+        truths[struct] = bool(v); return v, truths[struct]
     op, kids = struct
-    v = None
+    v = t = None
     for k in kids:
-        v = _eval(k, leaves, truths)
-        if (op == "and" and not v) or (op == "or" and v): return v
-    return v
+        v, t = _eval(k, leaves, truths, flags)
+        if (op == "and" and not t) or (op == "or" and t): return v, t
+    return v, t
 
 def _bool(site, struct, *leaves):
-    truths = [None] * len(leaves)
-    v = _eval(struct, leaves, truths)
-    d = _bools.setdefault(site, {}).setdefault(tuple(truths), set())
-    d.add(_ctx[0])
+    truths = [None] * len(leaves); flags = []
+    v, _ = _eval(struct, leaves, truths, flags)
+    key = tuple("?" if i in flags else x for i, x in enumerate(truths))   # "?" = custom truthiness: hazard
+    _bools.setdefault(site, {}).setdefault(key, set()).add(_ctx[0])
     return v
 
 builtins.__bb_bool__ = _bool

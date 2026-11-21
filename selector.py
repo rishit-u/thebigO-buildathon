@@ -228,6 +228,9 @@ class Selector:
                     if fam == "bool":
                         old_s, new_s = detail; ts = set()
                         for truths, sid_ in info["bool_sites"][f"{ln}:{col}"]:
+                            if "?" in truths:
+                                if sid_ == -1: why.append(f"{path}:{ln} and/or change, custom truthiness at import -> all"); return self.ALL
+                                ts |= set(self.sets[sid_]); continue
                             u_old, u_new = set(), set()
                             r_old = eval3(old_s, truths, u_old); r_new = eval3(new_s, truths, u_new)
                             if r_new is None or bool(r_new) != bool(r_old) or u_new != u_old:

@@ -76,14 +76,20 @@ def control_flow_change(hunks):
     return False
 
 def changed_old_lines(hunks):
-    """Old-file lines removed or edited, and insertion points (old line before which new lines go)."""
+    """Old-file lines removed or edited, and insertion points (old line before which new lines go).
+    A run of k removed lines followed by j added lines is an edit of those k lines; only when j > k
+    do the extra added lines count as an insertion, right after the last removed line."""
     removed, inserted_before = set(), set()
     for start, body in hunks:
-        ln = start
-        for op, _ in body:
-            if op == " ": ln += 1
-            elif op == "-": removed.add(ln); ln += 1
-            else: inserted_before.add(ln)
+        ln = start; i = 0
+        while i < len(body):
+            op = body[i][0]
+            if op == " ":
+                ln += 1; i += 1; continue
+            run_minus = run_plus = 0
+            while i < len(body) and body[i][0] == "-": removed.add(ln); ln += 1; run_minus += 1; i += 1
+            while i < len(body) and body[i][0] == "+": run_plus += 1; i += 1
+            if run_plus > run_minus: inserted_before.add(ln)
     return removed, inserted_before
 
 # ---------- deciding tests ----------
@@ -171,7 +177,7 @@ class Selector:
             ts = set()
             for x in range(best[0], best[1] + 1):
                 if str(x) in lines: ts |= set(self.sets[lines[str(x)]])
-            return ts
+            return ts or None   # no line of the lambda ever ran: coverage may be incomplete, use the file level
 
         def tests_for_stmt(st, ln=None):
             s, e, scope = st

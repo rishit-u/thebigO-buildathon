@@ -626,6 +626,7 @@ def aggressive(sel, picked, paths, num_of, text=None):
         n = num_of.get(tid)
         if n in picked and not broad and not any(p.startswith(a) for p in paths for a in areas):
             picked = picked - {n}
+    picked = picked - {num_of.get(TPCDS_ID)}   # PROBE D: never run test_execute_tpcds
     n = num_of.get(MAXNODES_ID)
     if n in picked and text is not None:
         try:

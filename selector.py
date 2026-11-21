@@ -206,6 +206,70 @@ class Selector:
         self.test_files = m["test_files"]; self.ALL = set(self.sets[m["all"]])
         self.profiled = m.get("profiled", False)
         self.tpcds = m.get("tpcds")
+        self.m = {k: m.get(k) for k in ("dicts", "dict_groups", "dict_group_of", "dict_sites", "dict_merge_hazard", "dicts_profiled")}
+
+    def dict_value_edit(self, path, old_tree, new_tree, why):
+        """Fast mode: the only change is to values (not keys) of dicts assigned in class bodies.
+        Selects the tests that read those entries (d[k] / d.get(k)) or all values of the dict, in
+        that dict or in dicts holding the very same value objects (class-body {**Parent.X} merges).
+        None when the rule does not apply (then the normal rules run)."""
+        import copy
+        def entries(tree):
+            out = {}
+            def walk(body, q):
+                for st in body:
+                    if isinstance(st, ast.ClassDef):
+                        qq = (q + "." if q else "") + st.name
+                        for x in st.body:
+                            if isinstance(x, ast.Assign) and len(x.targets) == 1 and isinstance(x.targets[0], ast.Name) and isinstance(x.value, ast.Dict):
+                                out[(qq, x.targets[0].id)] = x
+                        walk(st.body, qq)
+            walk(tree.body, ""); return out
+        def stripped(tree):
+            t = copy.deepcopy(tree)
+            for x in entries(t).values(): x.value.values = [ast.Constant(None) for _ in x.value.values]
+            return ast.dump(t)
+        old_e, new_e = entries(old_tree), entries(new_tree)
+        if not old_e or stripped(old_tree) != stripped(new_tree): return None
+        D, groups, gof = self.m["dicts"], self.m["dict_groups"], self.m["dict_group_of"]
+        inst, hazard = set(self.m["dict_sites"]), set(self.m["dict_merge_hazard"])
+        def key_reprs(k):
+            if isinstance(k, ast.Constant) and isinstance(k.value, (str, int, float, bool, type(None))): return [repr(k.value)]
+            if isinstance(k, ast.Attribute):
+                base = k.value.attr if isinstance(k.value, ast.Attribute) else getattr(k.value, "id", None)
+                return [k.attr] + ([f"{base}.{k.attr}"] if base else [])
+            if isinstance(k, ast.Name): return [k.id]
+            return None
+        def site_tests(site, keys):
+            d = D.get(site, {"reads": {}, "all": -1, "derived": [], "flags": []})
+            if d["flags"] or "*" in d["derived"] or any(k in d["derived"] for k in keys): return None
+            ts = set(self.sets[d["all"]]) if d["all"] >= 0 else set()
+            for k in keys:
+                if k in d["reads"]: ts |= set(self.sets[d["reads"][k]])
+            return ts
+        picked, n_entries = set(), 0
+        for key, o in old_e.items():
+            n = new_e[key]
+            changed = [i for i, (a, b) in enumerate(zip(o.value.values, n.value.values)) if ast.dump(a) != ast.dump(b)]
+            if not changed: continue
+            site = f"{path}:{o.lineno}"
+            if site not in inst or key[1] in hazard: return None
+            for i in changed:
+                ks = key_reprs(o.value.keys[i])
+                if ks is None: return None
+                todo = {(site, k) for k in ks}
+                for k in ks:   # entries holding the same value object (merged copies)
+                    g = gof.get(f"{site}|{k}")
+                    if g is not None: todo |= {tuple(e) for e in groups[g]}
+                for s2, k2 in todo:
+                    if s2 != site and s2 not in inst: return None
+                    ts = site_tests(s2, [k2] if s2 != site else ks)
+                    if ts is None: return None
+                    picked |= ts
+                n_entries += 1
+        if not n_entries: return None
+        why.append(f"{path}: {n_entries} class-body dict value(s) changed -> {len(picked)} tests that read them")
+        return picked
 
     def py_source(self, path, hunks, why):
         info = self.files[path]
@@ -244,6 +308,9 @@ class Selector:
                     ts = set(self.sets[sid_]) if sid_ is not None else set()
                     picked |= ts; why.append(f"{path}:{ln} {fam} operator swap -> {len(ts)} tests where it could differ")
                 return picked
+        if AGGRESSIVE and self.m.get("dicts_profiled"):
+            r = self.dict_value_edit(path, old_tree, new_tree, why)
+            if r is not None: return readers | r
         registry = registry_change(path, old_tree, new_tree)
         spans = info["spans"]; starts = [s[0] for s in spans]
         lines, users = info["lines"], set(self.sets[info["users"]])

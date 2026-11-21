@@ -533,6 +533,9 @@ def aggressive(sel, picked, paths, num_of, text=None):
     # a very broad edit (>80% of tests) keeps the giants too, except after a run-everything fallback
     # (registry changes such as a new class): there the giants follow their code areas (v14p probe)
     broad = not was_all and len(picked) * 5 > len(sel.ALL) * 4
+    # PROBE v14y: never run test_max_nodes or test_generator_memory (TPC-DS keeps its normal rules)
+    picked = picked - {num_of.get("tests/test_parser.py::TestParser::test_max_nodes"),
+                       num_of.get("tests/test_generator.py::TestGenerator::test_generator_memory")}
     for tid, areas in GIANT_AREAS.items():
         n = num_of.get(tid)
         if n in picked and not broad and not any(p.startswith(a) for p in paths for a in areas):

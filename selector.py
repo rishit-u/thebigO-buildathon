@@ -68,6 +68,35 @@ def changed_old_lines(hunks):
     return removed, inserted_before
 
 # ---------- deciding tests ----------
+GLOBAL_CLASS_ATTRS = {"_sql_names"}   # read at import into registries shared by every dialect
+
+def registry_change(path, old, new):
+    """Edits whose effect is not limited to users of this module's classes. '' if none."""
+    if path.endswith("__init__.py"): return "package __init__"
+    def imports(t): return [ast.dump(n) for n in ast.walk(t) if isinstance(n, (ast.Import, ast.ImportFrom))]
+    if imports(old) != imports(new): return "imports changed"
+    def classes(t):
+        out = {}
+        def visit(body, prefix):
+            for n in body:
+                if isinstance(n, ast.ClassDef):
+                    q = prefix + n.name
+                    attrs = {}
+                    for st in n.body:
+                        targets = st.targets if isinstance(st, ast.Assign) else [st.target] if isinstance(st, ast.AnnAssign) else []
+                        for tg in targets:
+                            if isinstance(tg, ast.Name) and tg.id in GLOBAL_CLASS_ATTRS:
+                                attrs[tg.id] = ast.dump(st.value) if st.value is not None else ""
+                    out[q] = (ast.dump(ast.Tuple(n.bases, ast.Load())), str([ast.dump(k) for k in n.keywords]), attrs)
+                    visit(n.body, q + ".")
+        visit(t.body, "")
+        return out
+    co, cn = classes(old), classes(new)
+    if set(co) != set(cn): return "classes added/removed/renamed"
+    for q in co:
+        if co[q][:2] != cn[q][:2]: return f"bases of {q} changed"
+        if co[q][2] != cn[q][2]: return f"registry attribute of {q} changed"
+    return ""
 class Selector:
     def __init__(self):
         m = json.loads(gzip.decompress(MAP.read_bytes()))
@@ -81,8 +110,11 @@ class Selector:
             new_tree = ast.parse(new_text)
         except SyntaxError:
             why.append(f"{path}: syntax error -> all"); return self.ALL
+        readers = set(self.sets[self.reads[path]]) if path in self.reads else set()  # tests that read this source as text
         if ast.dump(new_tree) == info["ast"]:
-            why.append(f"{path}: same AST (comment/whitespace) -> none"); return set()
+            why.append(f"{path}: same AST (comment/whitespace) -> {len(readers)} source readers"); return readers
+        mod_users = set(self.sets[info["mod_users"]])
+        registry = registry_change(path, ast.parse(info["text"]), new_tree)
         spans = info["spans"]; starts = [s[0] for s in spans]
         lines, users = info["lines"], set(self.sets[info["users"]])
         import_lines = set(info.get("import_lines", []))
@@ -100,8 +132,9 @@ class Selector:
 
         def tests_for_stmt(st):
             s, e, scope = st
-            if scope == "m":   # runs at import: coverage only credits the first importer,
-                return self.ALL, "module-level"   # and class attributes are read by code elsewhere
+            if scope == "m":   # runs at import: who depends on it is who uses this module's objects
+                if registry: return self.ALL, f"module-level, {registry}"
+                return mod_users, "module-level"
             if any(ln in import_lines for ln in range(s, e + 1)):
                 return self.ALL, "runs at import"   # e.g. metaclasses, factories called in class bodies
             ts = set()
@@ -114,16 +147,17 @@ class Selector:
             if st is None:   # blank/comment line outside any statement: look at neighbours
                 inserted.add(ln); continue
             ts, kind = tests_for_stmt(st); picked |= ts
-            if kind != "function": why.append(f"{path}:{ln} {kind} -> all")
+            if kind != "function": why.append(f"{path}:{ln} {kind} -> {len(ts)}")
         for ln in sorted(inserted):
             for nb in (ln - 1, ln):   # statements just above and at the insertion point
                 st = stmt_at(nb)
                 if st is None: continue
                 ts, kind = tests_for_stmt(st); picked |= ts
             if stmt_at(ln - 1) is None and stmt_at(ln) is None:
-                picked |= self.ALL; why.append(f"{path}:{ln} insert between statements -> all")
+                if registry: picked |= self.ALL; why.append(f"{path}:{ln} insert, {registry} -> all")
+                else: picked |= mod_users; why.append(f"{path}:{ln} insert at module level -> {len(mod_users)}")
         why.append(f"{path}: {len(picked)} tests")
-        return picked
+        return picked | readers
 
     def select(self, patch_text):
         why, picked = [], set()

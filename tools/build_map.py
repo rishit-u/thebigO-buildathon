@@ -85,18 +85,120 @@ for path in sorted(cov.measured_files()):
         "spans": spans(tree),
         "import_lines": import_lines,  # lines run at import time: a change there affects everyone
         "ast": ast.dump(tree),
-        "text": text,                  # pinned source, so patches can be applied at run time         # compared with the patched file's AST
+        "text": text,                  # pinned source, so patches can be applied at run time
     }
 
-# Fixture map: non-Python repo files each test opened.
+# Fixture map: repo files each test opened (fixtures, and explicit reads of .py source).
 reads = {}
-for f in glob.glob(os.path.join(reads_dir, "*.json")):
+for f in glob.glob(os.path.join(reads_dir, "reads-*.json")):
     for k, v in json.load(open(f)).items():
         for p in v: reads.setdefault(p, set()).add(k)
 read_map = {}
 for p, ks in reads.items():
     if any(k.startswith("<") and not k.startswith("<class>") for k in ks): read_map[p] = sid(ALL)   # read at collection: affects everyone
     else: read_map[p] = sid(ctx_tests(ks))
+
+# Instantiation map: source file -> tests that created an object whose MRO has a class from it.
+inst = {}
+for f in glob.glob(os.path.join(reads_dir, "inst-*.json")):
+    for ctx, fs in json.load(open(f)).items():
+        if ctx.startswith("<") and not ctx.startswith("<class>"):
+            continue   # created while importing: covered by the import-time rule
+        ts = ctx_tests([ctx])
+        for p in fs: inst.setdefault(p, set()).update(ts)
+
+# Static import graph of sqlglot (any import anywhere in a file). Package __init__ files are
+# re-export hubs that everything imports, so they are not followed as importers.
+modfile = {}
+for rel in files:
+    mod = rel[:-3].replace("/", ".")
+    if mod.endswith(".__init__"): mod = mod[: -len(".__init__")]
+    modfile[mod] = rel
+# Top-level bindings of each file: classes and functions are tracked by the instantiation map
+# and by coverage; constants (anything else) can be read silently by importers.
+kinds = {}
+for rel, info in files.items():
+    k = {}
+    for st in ast.parse(info["text"]).body:
+        if isinstance(st, ast.ClassDef): k[st.name] = "class"
+        elif isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)): k[st.name] = "def"
+        elif isinstance(st, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            for tg in (st.targets if isinstance(st, ast.Assign) else [st.target]):
+                for n in ast.walk(tg):
+                    if isinstance(n, ast.Name): k[n.id] = "const"
+    kinds[rel] = k
+
+def silent(f, names):
+    """Does importing `names` from file f bring in something only coverage/instances can't see?"""
+    if names is None: return True              # the module object itself
+    return any(kinds[f].get(n, "const") == "const" for n in names)
+
+# For each import of a constant or module object: where the importer uses that name.
+uses = {rel: [] for rel in files}     # f -> [(importer g, [lines in g that use it])]
+def dotted(n):
+    parts = []
+    while isinstance(n, ast.Attribute): parts.append(n.attr); n = n.value
+    if isinstance(n, ast.Name): parts.append(n.id); return ".".join(reversed(parts))
+    return None
+for rel, info in files.items():
+    if rel.endswith("__init__.py"): continue
+    pkg = rel[:-3].replace("/", ".").rsplit(".", 1)[0]
+    tree = ast.parse(info["text"])
+    found = []   # (file f, local name or dotted path to match)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a_ in node.names:
+                m = a_.name
+                while m and m not in modfile: m = m.rsplit(".", 1)[0] if "." in m else ""
+                if m: found.append((modfile[m], a_.asname or a_.name))
+        elif isinstance(node, ast.ImportFrom):
+            base = node.module or ""
+            if node.level:
+                parts = pkg.split(".")
+                base = ".".join(parts[: len(parts) - (node.level - 1)] + ([base] if base else []))
+            for a_ in node.names:
+                full = f"{base}.{a_.name}"
+                if full in modfile: found.append((modfile[full], a_.asname or a_.name))
+                else:
+                    m = base
+                    while m and m not in modfile: m = m.rsplit(".", 1)[0] if "." in m else ""
+                    if m and kinds[modfile[m]].get(a_.name, "const") == "const":
+                        found.append((modfile[m], a_.asname or a_.name))
+    for f, local in found:
+        if f == rel or f.endswith("__init__.py"): continue
+        lines = sorted({n.lineno for n in ast.walk(tree)
+                        if isinstance(n, (ast.Name, ast.Attribute)) and not isinstance(n, ast.Import)
+                        and (dotted(n) == local or (dotted(n) or "").startswith(local + "."))
+                        and isinstance(getattr(n, "ctx", None), ast.Load)})
+        if lines: uses[f].append((rel, lines))
+
+def scope_of(rel, ln):
+    for s_, e_, sc in files[rel]["spans"]:
+        if s_ <= ln <= e_: return (s_, e_, sc)
+    return None
+
+memo = {}
+def reach(rel, stack=()):
+    """Tests a module/class-level change in rel can reach."""
+    if rel in memo: return memo[rel]
+    if rel in stack: return set()
+    ts = set(sets[files[rel]["users"]]) | inst.get(rel, set())
+    if rel in reads: ts |= ctx_tests(reads[rel])
+    imp_lines = set(files[rel]["import_lines"])
+    for g, lines in uses[rel]:
+        g_lines, g_imp = files[g]["lines"], set(files[g]["import_lines"])
+        for ln in lines:
+            st = scope_of(g, ln)
+            if st is None or st[2] == "m" or any(x in g_imp for x in range(st[0], st[1] + 1)):
+                ts |= reach(g, stack + (rel,))          # used while importing g: whoever g reaches
+            else:
+                for x in range(st[0], st[1] + 1):        # used at run time: whoever runs that statement
+                    if str(x) in g_lines: ts |= set(sets[g_lines[str(x)]])
+    memo[rel] = ts
+    return ts
+
+for rel, info in files.items():
+    info["mod_users"] = sid(reach(rel))
 
 # Test files: their own tests, plus tests in files that import them (helpers, base classes).
 by_file = {}

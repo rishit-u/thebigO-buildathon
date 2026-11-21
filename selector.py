@@ -451,8 +451,7 @@ GIANT_AREAS = {
 # and the patched stages give the same structural hashes as the pinned ones for every query, the
 # executor gets identical inputs and runs identical code: the test cannot change outcome.
 TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
-TPCDS_CHECK = False
-PROBE_NO_GIANTS = True   # v14z probe only: not a final candidate   # v14b: stage-fingerprint check off (it costs container CPU on every flagged commit)
+TPCDS_CHECK = False   # v14b: stage-fingerprint check off (it costs container CPU on every flagged commit)
 APP = Path(__file__).resolve().parent
 PINNED_DIR, PINNED_FP, SPEC = APP / "pinned", APP / "tpcds_pinned.json", APP / "tpcds_spec.json"
 
@@ -534,8 +533,6 @@ def aggressive(sel, picked, paths, num_of, text=None):
     # a very broad edit (>80% of tests) keeps the giants too, except after a run-everything fallback
     # (registry changes such as a new class): there the giants follow their code areas (v14p probe)
     broad = not was_all and len(picked) * 5 > len(sel.ALL) * 4
-    if PROBE_NO_GIANTS:   # probe: never run the three giant tests (measures their share of practice)
-        return picked - {num_of.get(t) for t in GIANT_AREAS}
     for tid, areas in GIANT_AREAS.items():
         n = num_of.get(tid)
         if n in picked and not broad and not any(p.startswith(a) for p in paths for a in areas):

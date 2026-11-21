@@ -3,3 +3,6 @@
 __pycache__/
 output.jsonl
 sqlglot/
+pinned/
+tpcds_pinned.json
+tpcds_spec.json

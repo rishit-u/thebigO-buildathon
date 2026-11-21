@@ -205,6 +205,71 @@ class Selector:
         self.sets = m["sets"]; self.files = m["files"]; self.reads = m["reads"]
         self.test_files = m["test_files"]; self.ALL = set(self.sets[m["all"]])
         self.profiled = m.get("profiled", False)
+        self.tpcds = m.get("tpcds")
+        self.m = {k: m.get(k) for k in ("dicts", "dict_groups", "dict_group_of", "dict_sites", "dict_merge_hazard", "dicts_profiled")}
+
+    def dict_value_edit(self, path, old_tree, new_tree, why):
+        """Fast mode: the only change is to values (not keys) of dicts assigned in class bodies.
+        Selects the tests that read those entries (d[k] / d.get(k)) or all values of the dict, in
+        that dict or in dicts holding the very same value objects (class-body {**Parent.X} merges).
+        None when the rule does not apply (then the normal rules run)."""
+        import copy
+        def entries(tree):
+            out = {}
+            def walk(body, q):
+                for st in body:
+                    if isinstance(st, ast.ClassDef):
+                        qq = (q + "." if q else "") + st.name
+                        for x in st.body:
+                            if isinstance(x, ast.Assign) and len(x.targets) == 1 and isinstance(x.targets[0], ast.Name) and isinstance(x.value, ast.Dict):
+                                out[(qq, x.targets[0].id)] = x
+                        walk(st.body, qq)
+            walk(tree.body, ""); return out
+        def stripped(tree):
+            t = copy.deepcopy(tree)
+            for x in entries(t).values(): x.value.values = [ast.Constant(None) for _ in x.value.values]
+            return ast.dump(t)
+        old_e, new_e = entries(old_tree), entries(new_tree)
+        if not old_e or stripped(old_tree) != stripped(new_tree): return None
+        D, groups, gof = self.m["dicts"], self.m["dict_groups"], self.m["dict_group_of"]
+        inst, hazard = set(self.m["dict_sites"]), set(self.m["dict_merge_hazard"])
+        def key_reprs(k):
+            if isinstance(k, ast.Constant) and isinstance(k.value, (str, int, float, bool, type(None))): return [repr(k.value)]
+            if isinstance(k, ast.Attribute):
+                base = k.value.attr if isinstance(k.value, ast.Attribute) else getattr(k.value, "id", None)
+                return [k.attr] + ([f"{base}.{k.attr}"] if base else [])
+            if isinstance(k, ast.Name): return [k.id]
+            return None
+        def site_tests(site, keys):
+            d = D.get(site, {"reads": {}, "all": -1, "derived": [], "flags": []})
+            if d["flags"] or "*" in d["derived"] or any(k in d["derived"] for k in keys): return None
+            ts = set(self.sets[d["all"]]) if d["all"] >= 0 else set()
+            for k in keys:
+                if k in d["reads"]: ts |= set(self.sets[d["reads"][k]])
+            return ts
+        picked, n_entries = set(), 0
+        for key, o in old_e.items():
+            n = new_e[key]
+            changed = [i for i, (a, b) in enumerate(zip(o.value.values, n.value.values)) if ast.dump(a) != ast.dump(b)]
+            if not changed: continue
+            site = f"{path}:{o.lineno}"
+            if site not in inst or key[1] in hazard: return None
+            for i in changed:
+                ks = key_reprs(o.value.keys[i])
+                if ks is None: return None
+                todo = {(site, k) for k in ks}
+                for k in ks:   # entries holding the same value object (merged copies)
+                    g = gof.get(f"{site}|{k}")
+                    if g is not None: todo |= {tuple(e) for e in groups[g]}
+                for s2, k2 in todo:
+                    if s2 != site and s2 not in inst: return None
+                    ts = site_tests(s2, [k2] if s2 != site else ks)
+                    if ts is None: return None
+                    picked |= ts
+                n_entries += 1
+        if not n_entries: return None
+        why.append(f"{path}: {n_entries} class-body dict value(s) changed -> {len(picked)} tests that read them")
+        return picked
 
     def py_source(self, path, hunks, why):
         info = self.files[path]
@@ -243,6 +308,9 @@ class Selector:
                     ts = set(self.sets[sid_]) if sid_ is not None else set()
                     picked |= ts; why.append(f"{path}:{ln} {fam} operator swap -> {len(ts)} tests where it could differ")
                 return picked
+        if AGGRESSIVE and self.m.get("dicts_profiled"):
+            r = self.dict_value_edit(path, old_tree, new_tree, why)
+            if r is not None: return readers | r
         registry = registry_change(path, old_tree, new_tree)
         spans = info["spans"]; starts = [s[0] for s in spans]
         lines, users = info["lines"], set(self.sets[info["users"]])
@@ -377,8 +445,84 @@ GIANT_AREAS = {
     "tests/test_generator.py::TestGenerator::test_generator_memory": ("sqlglot/generator.py", "sqlglot/dialects/dialect.py"),
 }
 
-def aggressive(sel, picked, paths, num_of):
-    if len(picked) >= len(sel.ALL) - 1:   # run-everything fallback: tests that ran the changed files
+# ---------- TPC-DS stage fingerprints (fast mode) ----------
+# test_execute_tpcds = parse -> pickle -> optimize -> Plan -> Python executor, compared with DuckDB on
+# transpile(write="duckdb"). If the patch only changes functions that run inside the first stages,
+# and the patched stages give the same structural hashes as the pinned ones for every query, the
+# executor gets identical inputs and runs identical code: the test cannot change outcome.
+TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+TPCDS_CHECK = False   # v14b: stage-fingerprint check off (it costs container CPU on every flagged commit)
+APP = Path(__file__).resolve().parent
+PINNED_DIR, PINNED_FP, SPEC = APP / "pinned", APP / "tpcds_pinned.json", APP / "tpcds_spec.json"
+
+def write_tree(sel, root, changed=None):
+    for rel, info in sel.files.items():
+        if not rel.startswith("sqlglot/"): continue
+        p = root / rel; p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text((changed or {}).get(rel, info["text"]), encoding="utf-8")
+
+def run_fp(root, timeout=40, pinned=None):
+    import subprocess
+    r = subprocess.run([sys.executable, "-I", str(APP / "tpcds_fp.py"), str(root), str(SPEC)] + ([str(pinned)] if pinned else []),
+                       capture_output=True, text=True, timeout=timeout,
+                       env={"PYTHONDONTWRITEBYTECODE": "1", "PATH": os.environ.get("PATH", "")})
+    if r.returncode != 0: raise RuntimeError("fingerprint run failed: " + r.stderr[-300:])
+    return json.loads(r.stdout)
+
+def build_pinned(sel):
+    """At image build: pinned tree, spec, and pinned fingerprints (two runs must agree)."""
+    import compileall
+    SPEC.write_text(json.dumps({"queries": sel.tpcds["queries"], "schema": sel.tpcds["schema"]}))
+    write_tree(sel, PINNED_DIR)
+    compileall.compile_dir(str(PINNED_DIR), quiet=1)
+    a, b = run_fp(PINNED_DIR, 300), run_fp(PINNED_DIR, 300)
+    if a != b: log("pinned fingerprints are not deterministic: feature off"); return
+    PINNED_FP.write_text(json.dumps(a)); log("pinned TPC-DS fingerprints:", len(a))
+
+def tpcds_checkable(sel, files):
+    """Every change is inside the body of a function that never runs outside the fingerprinted stages."""
+    other = sel.tpcds["other"]
+    for f in files:
+        path = f["new"] or f["old"]
+        if not (path and f["old"] == f["new"] and path.startswith("sqlglot/") and path.endswith(".py") and path in sel.files):
+            return False
+        old_text = sel.files[path]["text"]; old_tree = ast.parse(old_text)
+        new_tree = ast.parse(apply(old_text, f["hunks"]))
+        if registry_change(path, old_tree, new_tree): return False
+        removed, inserted = changed_old_lines(f["hunks"])
+        tops = [n for n in ast.walk(old_tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        bad = set(other.get(path, []))
+        for ln in removed | inserted:
+            outer = None
+            for fn in tops:   # outermost function whose body holds ln
+                if fn.body[0].lineno <= ln <= fn.end_lineno and (outer is None or fn.lineno < outer.lineno):
+                    outer = fn
+            if outer is None: return False                        # module or class level
+            span = set(range(outer.lineno, outer.end_lineno + 1))
+            if span & bad: return False                           # runs in the executor/comparison
+    return True
+
+def tpcds_unaffected(sel, text):
+    if not (sel.tpcds and PINNED_FP.exists()): return False
+    files = parse_patch(text)
+    if not tpcds_checkable(sel, files): return False
+    import shutil, tempfile
+    root = Path(tempfile.mkdtemp(prefix="brfp", dir="/tmp"))
+    try:
+        if PINNED_DIR.exists(): shutil.copytree(PINNED_DIR, root, dirs_exist_ok=True)
+        for f in files:
+            p = root / f["new"]
+            p.write_text(apply(sel.files[f["new"]]["text"], f["hunks"]), encoding="utf-8")
+            pyc = p.parent / "__pycache__"
+            for c in (pyc.glob(p.stem + ".*.pyc") if pyc.exists() else []): c.unlink()
+        res = run_fp(root, pinned=PINNED_FP)   # stops at the first differing query
+        return "mismatch" not in res and res == json.loads(PINNED_FP.read_text())
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+def aggressive(sel, picked, paths, num_of, text=None):
+    was_all = len(picked) >= len(sel.ALL) - 1
+    if was_all:   # run-everything fallback: tests that ran the changed files
         narrowed = set()
         for p in paths:
             if p in sel.files: narrowed |= set(sel.sets[sel.files[p]["users"]])
@@ -386,10 +530,20 @@ def aggressive(sel, picked, paths, num_of):
             elif p in sel.test_files: narrowed |= set(sel.sets[sel.test_files[p]])
             else: return picked            # unknown kind of file: keep everything
         picked = narrowed
+    # a very broad edit (>80% of tests) keeps the giants too, except after a run-everything fallback
+    # (registry changes such as a new class): there the giants follow their code areas (v14p probe)
+    broad = not was_all and len(picked) * 5 > len(sel.ALL) * 4
     for tid, areas in GIANT_AREAS.items():
         n = num_of.get(tid)
-        if n in picked and not any(p.startswith(a) for p in paths for a in areas):
+        if n in picked and not broad and not any(p.startswith(a) for p in paths for a in areas):
             picked = picked - {n}
+    n = num_of.get(TPCDS_ID)
+    if n in picked and text is not None and TPCDS_CHECK:
+        try:
+            if tpcds_unaffected(sel, text): picked = picked - {n}; log("  TPC-DS stage fingerprints unchanged: dropped")
+            else: log("  TPC-DS kept (not checkable, or fingerprints changed)")
+        except Exception as e:
+            log("  TPC-DS fingerprint check failed, keeping it:", repr(e)[:200])
     return picked
 
 # ---------- splitting over workers ----------
@@ -406,6 +560,8 @@ def split(nums, ms):
     return best[1]
 
 def main():
+    if sys.argv[1:] == ["--build-pinned"]:
+        build_pinned(Selector()); return
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     sel = Selector()
@@ -416,7 +572,7 @@ def main():
             nums, why = sel.select(text)
             if AGGRESSIVE:
                 paths = [f["new"] or f["old"] for f in parse_patch(text)]
-                if all(paths): nums = aggressive(sel, set(nums), paths, num_of)
+                if all(paths): nums = aggressive(sel, set(nums), paths, num_of, text)
         except Exception as e:  # never crash: a crash rejects the run, a wide answer only costs time
             nums, why = sel.ALL, [f"error {e!r} -> all"]
         nums = {n for n in nums if n in ms}

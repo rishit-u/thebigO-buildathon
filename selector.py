@@ -555,7 +555,8 @@ def build_pinned(sel):
                         "-", str(TPCDS_DATA), "--build"], capture_output=True, text=True, timeout=600)
     if r.returncode == 0: TPCDS_RESULTS.write_text(r.stdout); log("pinned TPC-DS results:", len(json.loads(r.stdout)))
     else: log("pinned TPC-DS results failed: check off")
-    if (APP / "tests.json").exists() and (PINNED_DIR / "tests").exists():   # runnable tests for the runner
+    if not RUNNABLE_PATH.exists() and (APP / "tests.json").exists() and (PINNED_DIR / "tests").exists():
+        # runnable tests for the runner (normally shipped prebuilt: running the suite twice is slow)
         import runner
         runner.build(str(APP / "tests.json")); log("runner: runnable tests", len(json.loads(RUNNABLE_PATH.read_text())))
     a, b = run_script("maxnodes_fp.py", PINNED_DIR, 300), run_script("maxnodes_fp.py", PINNED_DIR, 300)

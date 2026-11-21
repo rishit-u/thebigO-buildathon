@@ -48,6 +48,19 @@ def pytest_sessionfinish(session):
         mods[ctx] = sorted(files)
     with _orig(os.path.join(out, f"inst-{os.getpid()}.json"), "w") as f:
         json.dump(mods, f)
+    # and per class: "file::qualname" of every class in those MROs (class-level reach)
+    quals = {}
+    for ctx, types in _types.items():
+        q = set()
+        for t in types:
+            for c in t.__mro__:
+                m = sys.modules.get(c.__module__)
+                f = getattr(m, "__file__", None)
+                if f and os.path.realpath(f).startswith(ROOT + os.sep):
+                    q.add(os.path.relpath(os.path.realpath(f), ROOT) + "::" + c.__qualname__)
+        quals[ctx] = sorted(q)
+    with _orig(os.path.join(out, f"instq-{os.getpid()}.json"), "w") as f:
+        json.dump(quals, f)
     _write_attr_reads()
 
 

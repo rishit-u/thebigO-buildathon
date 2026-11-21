@@ -228,6 +228,9 @@ class Selector:
                     if fam == "bool":
                         old_s, new_s = detail; ts = set()
                         for truths, sid_ in info["bool_sites"][f"{ln}:{col}"]:
+                            if "?" in truths:
+                                if sid_ == -1: why.append(f"{path}:{ln} and/or change, custom truthiness at import -> all"); return self.ALL
+                                ts |= set(self.sets[sid_]); continue
                             u_old, u_new = set(), set()
                             r_old = eval3(old_s, truths, u_old); r_new = eval3(new_s, truths, u_new)
                             if r_new is None or bool(r_new) != bool(r_old) or u_new != u_old:
@@ -268,6 +271,20 @@ class Selector:
                 k -= 1
             return None
 
+        def class_reach(s):
+            """Aggressive mode: a statement in a class body (not its header) reaches the tests that
+            created an object with that class, or an enclosing class, in its MRO."""
+            inner = None
+            for q, a, b, sid_ in info.get("classes", []):
+                if a <= s <= b and (inner is None or a >= inner[1]): inner = (q, a, b, sid_)
+            if inner is None or s == inner[1]: return None
+            ts = set()
+            for q, a, b, sid_ in info.get("classes", []):
+                if a <= s <= b:
+                    if sid_ < 0: return None
+                    ts |= set(self.sets[sid_])
+            return ts, f"class body of {inner[0]}"
+
         def in_lambda(ln):
             """Tests that called the innermost lambda whose body holds ln, if ln is runtime-only code."""
             if ln in import_lines: return None
@@ -298,6 +315,9 @@ class Selector:
                 if sa is not None: return sa[0], f"reads of {sa[1]}"
             if scope == "m":   # runs at import: who depends on it is who uses this module's objects
                 if registry: return self.ALL, f"module-level, {registry}"
+                if AGGRESSIVE:
+                    cr = class_reach(s)
+                    if cr is not None: return cr
                 return mod_users, "module-level"
             if any(ln in import_lines for ln in range(s, e + 1)):
                 return self.ALL, "runs at import"   # e.g. metaclasses, factories called in class bodies
@@ -344,6 +364,34 @@ class Selector:
                 why.append(f"{path}: unknown kind of change -> all"); return self.ALL, why
         return picked, why
 
+# ---------- aggressive mode (opt-in, accepts miss risk for speed) ----------
+# Keep a giant test only when the edit is in code that test specifically checks; replace
+# run-everything fallbacks with the tests that ran any line of the changed files.
+AGGRESSIVE = os.environ.get("BR_SAFE") != "1"
+GIANT_AREAS = {
+    "tests/test_executor.py::TestExecutor::test_execute_tpcds": ("sqlglot/executor/", "sqlglot/planner.py", "sqlglot/optimizer/",
+        "sqlglot/serde.py", "sqlglot/generators/python.py", "sqlglot/generators/duckdb.py", "sqlglot/dialects/duckdb.py",
+        "sqlglot/parsers/duckdb.py", "tests/fixtures/optimizer/tpc-ds/"),
+    "tests/test_parser.py::TestParser::test_max_nodes": ("sqlglot/parser.py", "sqlglot/tokens.py", "sqlglot/tokenizer_core.py",
+        "sqlglot/errors.py"),
+    "tests/test_generator.py::TestGenerator::test_generator_memory": ("sqlglot/generator.py", "sqlglot/dialects/dialect.py"),
+}
+
+def aggressive(sel, picked, paths, num_of):
+    if len(picked) >= len(sel.ALL) - 1:   # run-everything fallback: tests that ran the changed files
+        narrowed = set()
+        for p in paths:
+            if p in sel.files: narrowed |= set(sel.sets[sel.files[p]["users"]])
+            elif p in sel.reads: narrowed |= set(sel.sets[sel.reads[p]])
+            elif p in sel.test_files: narrowed |= set(sel.sets[sel.test_files[p]])
+            else: return picked            # unknown kind of file: keep everything
+        picked = narrowed
+    for tid, areas in GIANT_AREAS.items():
+        n = num_of.get(tid)
+        if n in picked and not any(p.startswith(a) for p in paths for a in areas):
+            picked = picked - {n}
+    return picked
+
 # ---------- splitting over workers ----------
 def split(nums, ms):
     """Try 1..8 workers, longest test first onto the lightest worker; keep the cheapest."""
@@ -361,9 +409,14 @@ def main():
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     sel = Selector()
+    num_of = {t["id"]: t["number"] for t in tests}
     for patch in sorted((DATA / "commits").glob("*.patch")):
         try:
-            nums, why = sel.select(patch.read_text(encoding="utf-8", errors="replace"))
+            text = patch.read_text(encoding="utf-8", errors="replace")
+            nums, why = sel.select(text)
+            if AGGRESSIVE:
+                paths = [f["new"] or f["old"] for f in parse_patch(text)]
+                if all(paths): nums = aggressive(sel, set(nums), paths, num_of)
         except Exception as e:  # never crash: a crash rejects the run, a wide answer only costs time
             nums, why = sel.ALL, [f"error {e!r} -> all"]
         nums = {n for n in nums if n in ms}

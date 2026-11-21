@@ -451,6 +451,7 @@ GIANT_AREAS = {
 # and the patched stages give the same structural hashes as the pinned ones for every query, the
 # executor gets identical inputs and runs identical code: the test cannot change outcome.
 TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+TPCDS_CHECK = False   # v14b: stage-fingerprint check off (it costs container CPU on every flagged commit)
 APP = Path(__file__).resolve().parent
 PINNED_DIR, PINNED_FP, SPEC = APP / "pinned", APP / "tpcds_pinned.json", APP / "tpcds_spec.json"
 
@@ -534,7 +535,7 @@ def aggressive(sel, picked, paths, num_of, text=None):
         if n in picked and not broad and not any(p.startswith(a) for p in paths for a in areas):
             picked = picked - {n}
     n = num_of.get(TPCDS_ID)
-    if n in picked and text is not None:
+    if n in picked and text is not None and TPCDS_CHECK:
         try:
             if tpcds_unaffected(sel, text): picked = picked - {n}; log("  TPC-DS stage fingerprints unchanged: dropped")
             else: log("  TPC-DS kept (not checkable, or fingerprints changed)")

@@ -205,6 +205,7 @@ class Selector:
         self.sets = m["sets"]; self.files = m["files"]; self.reads = m["reads"]
         self.test_files = m["test_files"]; self.ALL = set(self.sets[m["all"]])
         self.profiled = m.get("profiled", False)
+        self.tpcds = m.get("tpcds")
 
     def py_source(self, path, hunks, why):
         info = self.files[path]
@@ -377,7 +378,80 @@ GIANT_AREAS = {
     "tests/test_generator.py::TestGenerator::test_generator_memory": ("sqlglot/generator.py", "sqlglot/dialects/dialect.py"),
 }
 
-def aggressive(sel, picked, paths, num_of):
+# ---------- TPC-DS stage fingerprints (fast mode) ----------
+# test_execute_tpcds = parse -> pickle -> optimize -> Plan -> Python executor, compared with DuckDB on
+# transpile(write="duckdb"). If the patch only changes functions that run inside the first stages,
+# and the patched stages give the same structural hashes as the pinned ones for every query, the
+# executor gets identical inputs and runs identical code: the test cannot change outcome.
+TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+APP = Path(__file__).resolve().parent
+PINNED_DIR, PINNED_FP, SPEC = APP / "pinned", APP / "tpcds_pinned.json", APP / "tpcds_spec.json"
+
+def write_tree(sel, root, changed=None):
+    for rel, info in sel.files.items():
+        if not rel.startswith("sqlglot/"): continue
+        p = root / rel; p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text((changed or {}).get(rel, info["text"]), encoding="utf-8")
+
+def run_fp(root, timeout=40):
+    import subprocess
+    r = subprocess.run([sys.executable, "-I", str(APP / "tpcds_fp.py"), str(root), str(SPEC)],
+                       capture_output=True, text=True, timeout=timeout,
+                       env={"PYTHONDONTWRITEBYTECODE": "1", "PATH": os.environ.get("PATH", "")})
+    if r.returncode != 0: raise RuntimeError("fingerprint run failed: " + r.stderr[-300:])
+    return json.loads(r.stdout)
+
+def build_pinned(sel):
+    """At image build: pinned tree, spec, and pinned fingerprints (two runs must agree)."""
+    import compileall
+    SPEC.write_text(json.dumps({"queries": sel.tpcds["queries"], "schema": sel.tpcds["schema"]}))
+    write_tree(sel, PINNED_DIR)
+    compileall.compile_dir(str(PINNED_DIR), quiet=1)
+    a, b = run_fp(PINNED_DIR, 300), run_fp(PINNED_DIR, 300)
+    if a != b: log("pinned fingerprints are not deterministic: feature off"); return
+    PINNED_FP.write_text(json.dumps(a)); log("pinned TPC-DS fingerprints:", len(a))
+
+def tpcds_checkable(sel, files):
+    """Every change is inside the body of a function that never runs outside the fingerprinted stages."""
+    other = sel.tpcds["other"]
+    for f in files:
+        path = f["new"] or f["old"]
+        if not (path and f["old"] == f["new"] and path.startswith("sqlglot/") and path.endswith(".py") and path in sel.files):
+            return False
+        old_text = sel.files[path]["text"]; old_tree = ast.parse(old_text)
+        new_tree = ast.parse(apply(old_text, f["hunks"]))
+        if registry_change(path, old_tree, new_tree): return False
+        removed, inserted = changed_old_lines(f["hunks"])
+        tops = [n for n in ast.walk(old_tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        bad = set(other.get(path, []))
+        for ln in removed | inserted:
+            outer = None
+            for fn in tops:   # outermost function whose body holds ln
+                if fn.body[0].lineno <= ln <= fn.end_lineno and (outer is None or fn.lineno < outer.lineno):
+                    outer = fn
+            if outer is None: return False                        # module or class level
+            span = set(range(outer.lineno, outer.end_lineno + 1))
+            if span & bad: return False                           # runs in the executor/comparison
+    return True
+
+def tpcds_unaffected(sel, text):
+    if not (sel.tpcds and PINNED_FP.exists()): return False
+    files = parse_patch(text)
+    if not tpcds_checkable(sel, files): return False
+    import shutil, tempfile
+    root = Path(tempfile.mkdtemp(prefix="brfp", dir="/tmp"))
+    try:
+        if PINNED_DIR.exists(): shutil.copytree(PINNED_DIR, root, dirs_exist_ok=True)
+        for f in files:
+            p = root / f["new"]
+            p.write_text(apply(sel.files[f["new"]]["text"], f["hunks"]), encoding="utf-8")
+            pyc = p.parent / "__pycache__"
+            for c in (pyc.glob(p.stem + ".*.pyc") if pyc.exists() else []): c.unlink()
+        return run_fp(root) == json.loads(PINNED_FP.read_text())
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+def aggressive(sel, picked, paths, num_of, text=None):
     if len(picked) >= len(sel.ALL) - 1:   # run-everything fallback: tests that ran the changed files
         narrowed = set()
         for p in paths:
@@ -386,11 +460,18 @@ def aggressive(sel, picked, paths, num_of):
             elif p in sel.test_files: narrowed |= set(sel.sets[sel.test_files[p]])
             else: return picked            # unknown kind of file: keep everything
         picked = narrowed
-    if len(picked) * 5 > len(sel.ALL) * 4: return picked   # a very broad edit (>80% of tests): keep the giants too
+    broad = len(picked) * 5 > len(sel.ALL) * 4   # a very broad edit (>80% of tests): keep the giants too
     for tid, areas in GIANT_AREAS.items():
         n = num_of.get(tid)
-        if n in picked and not any(p.startswith(a) for p in paths for a in areas):
+        if n in picked and not broad and not any(p.startswith(a) for p in paths for a in areas):
             picked = picked - {n}
+    n = num_of.get(TPCDS_ID)
+    if n in picked and text is not None:
+        try:
+            if tpcds_unaffected(sel, text): picked = picked - {n}; log("  TPC-DS stage fingerprints unchanged: dropped")
+            else: log("  TPC-DS kept (not checkable, or fingerprints changed)")
+        except Exception as e:
+            log("  TPC-DS fingerprint check failed, keeping it:", repr(e)[:200])
     return picked
 
 # ---------- splitting over workers ----------
@@ -407,6 +488,8 @@ def split(nums, ms):
     return best[1]
 
 def main():
+    if sys.argv[1:] == ["--build-pinned"]:
+        build_pinned(Selector()); return
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     sel = Selector()
@@ -417,7 +500,7 @@ def main():
             nums, why = sel.select(text)
             if AGGRESSIVE:
                 paths = [f["new"] or f["old"] for f in parse_patch(text)]
-                if all(paths): nums = aggressive(sel, set(nums), paths, num_of)
+                if all(paths): nums = aggressive(sel, set(nums), paths, num_of, text)
         except Exception as e:  # never crash: a crash rejects the run, a wide answer only costs time
             nums, why = sel.ALL, [f"error {e!r} -> all"]
         nums = {n for n in nums if n in ms}

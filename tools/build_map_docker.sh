@@ -32,6 +32,9 @@ docker run --rm --platform linux/amd64 \
     python /repo/tools/build_map.py /work/sqlglot /repo/sample/tests.json /work/reads /work/map.json
     # class-level reach for aggressive mode (instq-*.json from the first pass)
     python /repo/tools/add_class_inst.py /work/map.json /repo/sample/tests.json /work/reads /work/map.json
+    # TPC-DS fingerprint inputs: lines run outside the fingerprinted stages, queries and schema
+    SKIP_INTEGRATION=0 python /repo/tools/tpcds_stages.py /work/tpcds_other.json
+    python /repo/tools/add_tpcds.py /work/map.json /work/sqlglot /work/tpcds_other.json /work/map.json
     gzip -9f /work/map.json
   '
 

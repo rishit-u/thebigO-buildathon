@@ -386,6 +386,7 @@ def aggressive(sel, picked, paths, num_of):
             elif p in sel.test_files: narrowed |= set(sel.sets[sel.test_files[p]])
             else: return picked            # unknown kind of file: keep everything
         picked = narrowed
+    if len(picked) * 5 > len(sel.ALL) * 4: return picked   # a very broad edit (>80% of tests): keep the giants too
     for tid, areas in GIANT_AREAS.items():
         n = num_of.get(tid)
         if n in picked and not any(p.startswith(a) for p in paths for a in areas):

@@ -83,6 +83,9 @@ for path in sorted(cov.measured_files()):
         "users": sid(users),           # every test that ran any line of this file
         "lines": lines,                # line -> set id (only lines some test ran)
         "spans": spans(tree),
+        # function bodies [first body line, last line]: who entered a function = who ran any line in it
+        "funcs": sorted([n.body[0].lineno, n.end_lineno] for n in ast.walk(tree)
+                        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))),
         "import_lines": import_lines,  # lines run at import time: a change there affects everyone
         "ast": ast.dump(tree),
         "text": text,                  # pinned source, so patches can be applied at run time

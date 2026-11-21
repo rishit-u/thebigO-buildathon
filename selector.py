@@ -56,6 +56,25 @@ def apply(old_text, hunks):
     out.extend(old[i:])
     return "\n".join(out)
 
+CONTINUATION = {"elif", "else", "except", "finally", "case"}
+BLOCK = {"if", "for", "while", "try", "with", "match", "async", "def", "class", "lambda"}
+
+def first_word(l):
+    m = re.match(r"\s*([A-Za-z_]+)", l)
+    return m.group(1) if m else ""
+
+def control_flow_change(hunks):
+    """Does this edit change which code runs, rather than what one statement does?"""
+    for _, body in hunks:
+        removed = [l for op, l in body if op == "-"]; added = [l for op, l in body if op == "+"]
+        words_r = [first_word(l) for l in removed]; words_a = [first_word(l) for l in added]
+        if any(w in CONTINUATION for w in words_r + words_a): return True
+        if sorted(w for w in words_r if w in BLOCK) != sorted(w for w in words_a if w in BLOCK): return True
+        indent = lambda l: len(l) - len(l.lstrip())
+        if sorted(indent(l) for l in removed if l.strip()) != sorted(indent(l) for l in added if l.strip()):
+            if added or removed: return True
+    return False
+
 def changed_old_lines(hunks):
     """Old-file lines removed or edited, and insertion points (old line before which new lines go)."""
     removed, inserted_before = set(), set()
@@ -120,6 +139,18 @@ class Selector:
         import_lines = set(info.get("import_lines", []))
         removed, inserted = changed_old_lines(hunks)
         picked = set()
+        reroutes = control_flow_change(hunks)
+
+        def entered(ln):
+            """Tests that entered the innermost function around line ln."""
+            best = None
+            for a, b in info["funcs"]:
+                if a - 1 <= ln <= b + 1 and (best is None or b - a < best[1] - best[0]): best = (a, b)
+            if best is None: return None
+            ts = set()
+            for x in range(best[0], best[1] + 1):
+                if str(x) in lines: ts |= set(self.sets[lines[str(x)]])
+            return ts
 
         def stmt_at(ln):
             k = bisect.bisect_right(starts, ln) - 1
@@ -156,6 +187,13 @@ class Selector:
             if stmt_at(ln - 1) is None and stmt_at(ln) is None:
                 if registry: picked |= self.ALL; why.append(f"{path}:{ln} insert, {registry} -> all")
                 else: picked |= mod_users; why.append(f"{path}:{ln} insert at module level -> {len(mod_users)}")
+        if reroutes:   # control flow changed: anyone who entered the function may take a new path
+            for ln in sorted(removed | inserted):
+                st = stmt_at(ln) or stmt_at(ln - 1)
+                if st is not None and st[2] == "m": continue   # module level: handled above
+                ts = entered(ln)
+                if ts is None: picked |= mod_users; why.append(f"{path}:{ln} control flow outside a function -> {len(mod_users)}")
+                else: picked |= ts; why.append(f"{path}:{ln} control flow -> {len(ts)} who entered the function")
         why.append(f"{path}: {len(picked)} tests")
         return picked | readers
 

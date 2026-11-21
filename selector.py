@@ -555,6 +555,9 @@ def build_pinned(sel):
                         "-", str(TPCDS_DATA), "--build"], capture_output=True, text=True, timeout=600)
     if r.returncode == 0: TPCDS_RESULTS.write_text(r.stdout); log("pinned TPC-DS results:", len(json.loads(r.stdout)))
     else: log("pinned TPC-DS results failed: check off")
+    if (APP / "tests.json").exists() and (PINNED_DIR / "tests").exists():   # runnable tests for the runner
+        import runner
+        runner.build(str(APP / "tests.json")); log("runner: runnable tests", len(json.loads(RUNNABLE_PATH.read_text())))
     a, b = run_script("maxnodes_fp.py", PINNED_DIR, 300), run_script("maxnodes_fp.py", PINNED_DIR, 300)
     if a != b: log("pinned max_nodes results are not deterministic: check off"); return
     MAXNODES_PINNED.write_text(json.dumps(a)); log("pinned max_nodes results:", len(a))
@@ -639,6 +642,50 @@ def aggressive(sel, picked, paths, num_of, text=None):
     return picked
 
 # ---------- splitting over workers ----------
+# ---------- in-container runner (fast mode) ----------
+RUNNER = True
+RUNNABLE_PATH = APP / "runner_pinned.json"
+_runnable = None
+NEVER_RUN = {"tests/test_generator.py::TestGenerator::test_generator_memory"}   # order/memory sensitive
+
+def commit_cost(nums, ms):
+    w = split(nums, ms)
+    return (max(sum(ms[n] for n in x) for x in w) + 2000 * len(w)) / 1000 if w else 0.0
+
+def run_or_select(sel, text, nums, ms, id_of, why):
+    """Run a small selection in a forked child against the patched code when that is expected to cost
+    less CPU than the worker time it saves; then output only the tests that failed."""
+    global _runnable
+    if _runnable is None:
+        _runnable = set(json.loads(RUNNABLE_PATH.read_text())) if RUNNABLE_PATH.exists() else set()
+    ids = [id_of[n] for n in nums]
+    if not _runnable or any(i not in _runnable or i in NEVER_RUN for i in ids): return nums
+    load = sum(ms[n] for n in nums) / 1000
+    est = 0.3 + 1.6 * load                      # child CPU: fresh import + the tests (measured ~1.0-1.6x)
+    saved_if_clean = commit_cost(nums, ms)
+    if est >= saved_if_clean: return nums
+    files = {}
+    for f in parse_patch(text):
+        rel = f["new"]
+        if not rel or f["old"] != rel or not rel.endswith(".py"): return nums      # fixtures, adds, deletes
+        if rel.startswith("sqlglot/"):
+            if rel not in sel.files: return nums
+            base = sel.files[rel]["text"]
+        elif rel.startswith("tests/") and (PINNED_DIR / rel).exists():
+            base = (PINNED_DIR / rel).read_text(encoding="utf-8")
+        else:
+            return nums
+        files[rel] = apply(base, f["hunks"])
+    import runner
+    failed = runner.run(files, ids, timeout=max(5, 4 * est))
+    if failed is None:
+        why.append("runner: error or timeout, selection kept"); return nums
+    num_of_id = {id_of[n]: n for n in nums}
+    out = {num_of_id[i] for i in failed if i in num_of_id}
+    if len(out) != len(failed): return nums                                     # unexpected ids: be safe
+    why.append(f"runner: ran {len(nums)} tests ({load:.2f} s recorded), {len(out)} failed")
+    return out
+
 def split(nums, ms):
     """Try 1..8 workers, longest test first onto the lightest worker; keep the cheapest."""
     if not nums: return []
@@ -658,6 +705,7 @@ def main():
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     sel = Selector()
     num_of = {t["id"]: t["number"] for t in tests}
+    id_of = {t["number"]: t["id"] for t in tests}
     for patch in sorted((DATA / "commits").glob("*.patch")):
         try:
             text = patch.read_text(encoding="utf-8", errors="replace")
@@ -668,6 +716,11 @@ def main():
         except Exception as e:  # never crash: a crash rejects the run, a wide answer only costs time
             nums, why = sel.ALL, [f"error {e!r} -> all"]
         nums = {n for n in nums if n in ms}
+        if AGGRESSIVE and RUNNER and nums:
+            try:
+                nums = run_or_select(sel, text, nums, ms, id_of, why)
+            except Exception as e:
+                why.append(f"runner error {e!r}: selection kept")
         print(json.dumps({"commit": patch.stem, "workers": split(nums, ms)}))
         log(patch.stem, len(nums), "tests |", "; ".join(why))
 

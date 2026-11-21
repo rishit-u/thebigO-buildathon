@@ -94,6 +94,7 @@ def pytest_sessionstart(session):
             pass
     _install_instance_recorder()
     _install_attr_recorders()
+    _install_cache_misses()
 
 
 # --- which classes each test instantiates (dialects, parsers, generators, expressions...) ---
@@ -161,3 +162,36 @@ def _write_attr_reads():
     with _orig(os.path.join(out, f"attrs-{os.getpid()}.json"), "w") as f:
         json.dump({"reads": {k: sorted(v) for k, v in _attr_reads.items()},
                    "installed": sorted(d.key for _, _, d in _installed), "displaced": displaced}, f)
+
+
+# --- runtime caches: make every lookup a miss while building the map ---
+# sqlglot keeps per-process caches (generator._DISPATCH_CACHE) and per-object caches on schemas that
+# tests share (TestOptimizer installs one global MappingSchema). Coverage would credit the cached
+# computation only to the first test that filled the cache. With an always-miss .get(), every test
+# recomputes and is credited. Entries are still stored, so len() checks in tests see the same sizes.
+class _AlwaysMiss(dict):
+    def get(self, key, default=None):
+        return default
+
+class _NeverStore(_AlwaysMiss):
+    """Also stores nothing: for caches whose growth a test would see (test_generator_memory)."""
+    def __setitem__(self, key, value):
+        pass
+
+def _install_cache_misses():
+    import sqlglot.generator as gen
+    import sqlglot.schema as sch
+    gen._DISPATCH_CACHE = _NeverStore()
+    orig = sch.MappingSchema.__init__
+    def init(self, *a, __orig=orig, **k):
+        __orig(self, *a, **k)
+        for name in ("_find_cache", "_normalized_table_cache", "_normalized_name_cache"):
+            if isinstance(getattr(self, name, None), dict):
+                setattr(self, name, _AlwaysMiss(getattr(self, name)))
+    sch.MappingSchema.__init__ = init
+    import sqlglot   # the default global schema was created at import, before this patch
+    for obj in (getattr(sqlglot, "schema", None),):
+        if isinstance(obj, sch.MappingSchema):
+            for name in ("_find_cache", "_normalized_table_cache", "_normalized_name_cache"):
+                if isinstance(getattr(obj, name, None), dict):
+                    setattr(obj, name, _AlwaysMiss(getattr(obj, name)))

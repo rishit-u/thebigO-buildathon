@@ -30,6 +30,8 @@ docker run --rm --platform linux/amd64 \
     # second pass: value-level facts at comparisons (no coverage)
     python -m pytest tests -q -p no:cacheprovider -p valprof -n 2 | tail -3
     python /repo/tools/build_map.py /work/sqlglot /repo/sample/tests.json /work/reads /work/map.json
+    # class-level reach for aggressive mode (instq-*.json from the first pass)
+    python /repo/tools/add_class_inst.py /work/map.json /repo/sample/tests.json /work/reads /work/map.json
     gzip -9f /work/map.json
   '
 

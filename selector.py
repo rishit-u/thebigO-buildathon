@@ -271,6 +271,20 @@ class Selector:
                 k -= 1
             return None
 
+        def class_reach(s):
+            """Aggressive mode: a statement in a class body (not its header) reaches the tests that
+            created an object with that class, or an enclosing class, in its MRO."""
+            inner = None
+            for q, a, b, sid_ in info.get("classes", []):
+                if a <= s <= b and (inner is None or a >= inner[1]): inner = (q, a, b, sid_)
+            if inner is None or s == inner[1]: return None
+            ts = set()
+            for q, a, b, sid_ in info.get("classes", []):
+                if a <= s <= b:
+                    if sid_ < 0: return None
+                    ts |= set(self.sets[sid_])
+            return ts, f"class body of {inner[0]}"
+
         def in_lambda(ln):
             """Tests that called the innermost lambda whose body holds ln, if ln is runtime-only code."""
             if ln in import_lines: return None
@@ -301,6 +315,9 @@ class Selector:
                 if sa is not None: return sa[0], f"reads of {sa[1]}"
             if scope == "m":   # runs at import: who depends on it is who uses this module's objects
                 if registry: return self.ALL, f"module-level, {registry}"
+                if AGGRESSIVE:
+                    cr = class_reach(s)
+                    if cr is not None: return cr
                 return mod_users, "module-level"
             if any(ln in import_lines for ln in range(s, e + 1)):
                 return self.ALL, "runs at import"   # e.g. metaclasses, factories called in class bodies

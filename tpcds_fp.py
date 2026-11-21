@@ -27,40 +27,62 @@ def main():
         for p in parts: m.update(p.encode() if isinstance(p, str) else p); m.update(b"\x00")
         return m.hexdigest()
 
-    memo = {}
-    def eh(e):
-        """Structural hash of an expression: class, every arg, the annotated type, comments."""
-        k = id(e)
-        if k in memo: return memo[k][1]
-        parts = [type(e).__module__ + "." + type(e).__qualname__]
-        for key in sorted(e.args):
-            parts += [key, vh(e.args[key])]
-        parts += ["_type", vh(getattr(e, "_type", None)), "comments", vh(e.comments)]
-        r = h(*parts); memo[k] = (e, r); return r
+    # Serialize every value into one token list per stage and hash it once (fast, and exact: the
+    # token stream is unambiguous because every container is bracketed with its type and length).
+    Expr = exp.Expr
+    def ser(v, out):
+        if isinstance(v, Expr):
+            out.append("E" + type(v).__module__ + "." + type(v).__qualname__)
+            args = v.args
+            out.append(str(len(args)))
+            for key in sorted(args):
+                out.append(key); ser(args[key], out)
+            ser(getattr(v, "_type", None), out); ser(v.comments, out)
+            return
+        t = type(v)
+        if v is None or t is bool or t is int or t is str: out.append(t.__name__[0] + repr(v)); return
+        if t is float: out.append("f" + ("inf" if math.isinf(v) else repr(v))); return
+        if isinstance(v, Step): out.append("S" + step_hash(v)); return
+        if isinstance(v, type): out.append("T" + v.__module__ + "." + v.__qualname__); return
+        if isinstance(v, enum.Enum): out.append("N" + type(v).__qualname__ + "." + v.name); return
+        if isinstance(v, (list, tuple)):
+            out.append(t.__name__[0] + str(len(v)))
+            for x in v: ser(x, out)
+            return
+        if isinstance(v, (set, frozenset)):
+            parts = []
+            for x in v:
+                o = []; ser(x, o); parts.append("\x01".join(o))
+            out.append("s" + str(len(v))); out.extend(sorted(parts)); return
+        if isinstance(v, dict):
+            out.append("d" + str(len(v)))
+            for k, x in v.items(): ser(k, out); ser(x, out)
+            return
+        raise TypeError(f"unhashable value of type {t}")   # caller treats as mismatch
 
-    smemo = {}
+    def digest(out):
+        return hashlib.blake2b("\x00".join(out).encode(), digest_size=12).hexdigest()
     def vh(v):
-        if isinstance(v, exp.Expr): return eh(v)
-        if isinstance(v, Step): return sh(v)
-        if v is None or isinstance(v, (bool, int, str)): return h(type(v).__name__, repr(v))
-        if isinstance(v, float): return h("float", "inf" if math.isinf(v) else repr(v))
-        if isinstance(v, type): return h("type", v.__module__ + "." + v.__qualname__)
-        if isinstance(v, enum.Enum): return h("enum", type(v).__module__ + "." + type(v).__qualname__, v.name)
-        if isinstance(v, (list, tuple)): return h(type(v).__name__, *[vh(x) for x in v])
-        if isinstance(v, (set, frozenset)): return h("set", *sorted(vh(x) for x in v))
-        if isinstance(v, dict): return h("dict", *[vh(k) + vh(x) for k, x in v.items()])
-        raise TypeError(f"unhashable value of type {type(v)}")   # caller treats as mismatch
-
-    def sh(s):
-        k = id(s)
-        if k in smemo: return smemo[k][1]
-        parts = [type(s).__qualname__]
-        for key in sorted(vars(s)):
-            if key == "dependents": continue      # back edges: covered from the other side
-            parts += [key, vh(getattr(s, key))]
-        r = h(*parts); smemo[k] = (s, r); return r
+        o = []; ser(v, o); return digest(o)
+    eh = vh
+    smemo = {}
+    def step_hash(st):
+        k = id(st)
+        if k not in smemo:
+            o = [type(st).__qualname__]
+            for key in sorted(vars(st)):
+                if key == "dependents": continue      # back edges: covered from the other side
+                o.append(key); ser(getattr(st, key), o)
+            smemo[k] = (st, digest(o))
+        return smemo[k][1]
+    sh = step_hash
+    def h(*parts): return digest(list(parts))
+    class _M:
+        def clear(self): pass
+    memo = _M()
 
     schema = spec["schema"]
+    pinned = json.load(open(sys.argv[3])) if len(sys.argv) > 3 else None   # stop at the first difference
     out = {}
     for i, (execute, sql) in enumerate(spec["queries"]):
         try:
@@ -78,6 +100,8 @@ def main():
             row = ["error", type(ex).__name__, str(ex)[:200]]
         out[str(i)] = row
         memo.clear(); smemo.clear()
+        if pinned is not None and pinned.get(str(i)) != row:
+            json.dump({"mismatch": i}, sys.stdout); return
     json.dump(out, sys.stdout)
 
 

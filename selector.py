@@ -393,9 +393,9 @@ def write_tree(sel, root, changed=None):
         p = root / rel; p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text((changed or {}).get(rel, info["text"]), encoding="utf-8")
 
-def run_fp(root, timeout=40):
+def run_fp(root, timeout=40, pinned=None):
     import subprocess
-    r = subprocess.run([sys.executable, "-I", str(APP / "tpcds_fp.py"), str(root), str(SPEC)],
+    r = subprocess.run([sys.executable, "-I", str(APP / "tpcds_fp.py"), str(root), str(SPEC)] + ([str(pinned)] if pinned else []),
                        capture_output=True, text=True, timeout=timeout,
                        env={"PYTHONDONTWRITEBYTECODE": "1", "PATH": os.environ.get("PATH", "")})
     if r.returncode != 0: raise RuntimeError("fingerprint run failed: " + r.stderr[-300:])
@@ -447,7 +447,8 @@ def tpcds_unaffected(sel, text):
             p.write_text(apply(sel.files[f["new"]]["text"], f["hunks"]), encoding="utf-8")
             pyc = p.parent / "__pycache__"
             for c in (pyc.glob(p.stem + ".*.pyc") if pyc.exists() else []): c.unlink()
-        return run_fp(root) == json.loads(PINNED_FP.read_text())
+        res = run_fp(root, pinned=PINNED_FP)   # stops at the first differing query
+        return "mismatch" not in res and res == json.loads(PINNED_FP.read_text())
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

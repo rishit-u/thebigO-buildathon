@@ -205,6 +205,58 @@ def reach(rel, stack=()):
 for rel, info in files.items():
     info["mod_users"] = sid(reach(rel))
 
+# Scalar class attributes: which tests read (defining class, name). An attribute is kept only if
+# (a) its pinned value is an immutable scalar literal, (b) its name never appears as a read, a name or
+# a string in any statement that ran at import (aliases, merges, metaclass and __init_subclass__
+# code, __dict__ lookups by string), (c) its recorder was installed and never displaced during the
+# run, which also had identical test outcomes. Anything else keeps file-level reach.
+def scalar_literal(v):
+    if isinstance(v, ast.Constant): return True
+    if isinstance(v, ast.UnaryOp) and isinstance(v.operand, ast.Constant): return True
+    if isinstance(v, ast.Tuple): return all(scalar_literal(e) for e in v.elts)
+    return False
+import_names = set()
+for rel, info in files.items():
+    imp = set(info["import_lines"])
+    for node in ast.walk(ast.parse(info["text"])):
+        if getattr(node, "lineno", None) not in imp: continue
+        if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load): import_names.add(node.attr)
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load): import_names.add(node.id)
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str): import_names.add(node.value)
+attr_reads, installed, displaced = {}, set(), set()
+for f in glob.glob(os.path.join(reads_dir, "attrs-*.json")):
+    d = json.load(open(f)); installed |= set(d["installed"]); displaced |= set(d["displaced"])
+    for ctx, keys in d["reads"].items():
+        if ctx.startswith("<") and not ctx.startswith("<class>"): continue
+        ts = ctx_tests([ctx])
+        for k in keys: attr_reads.setdefault(k, set()).update(ts)
+file_mod = {rel: (rel[:-3].replace("/", ".")[: -len(".__init__")] if rel.endswith("__init__.py") else rel[:-3].replace("/", ".")) for rel in files}
+kept = 0
+for rel, info in files.items():
+    entries = []
+    def opaque(c):
+        """Classes whose attributes are consumed by stdlib machinery at import (dataclass defaults,
+        Enum members, NamedTuple/TypedDict fields, any class decorator): no symbol-level reads."""
+        if c.decorator_list: return True
+        names = {ast.unparse(b).split(".")[-1].split("[")[0] for b in c.bases}
+        return bool(names & {"Enum", "IntEnum", "StrEnum", "Flag", "IntFlag", "NamedTuple", "TypedDict", "AutoName"})
+    def visit(body, cls, blocked=False):
+        global kept
+        for st in body:
+            if isinstance(st, ast.ClassDef):
+                visit(st.body, (cls + "." if cls else "") + st.name, blocked or opaque(st)); continue
+            if blocked: continue
+            if cls and isinstance(st, (ast.Assign, ast.AnnAssign)) and st.value is not None:
+                tg = st.targets if isinstance(st, ast.Assign) else [st.target]
+                if len(tg) != 1 or not isinstance(tg[0], ast.Name) or tg[0].id.startswith("__"): continue
+                name = tg[0].id; key = f"{file_mod[rel]}:{cls}.{name}"
+                if not scalar_literal(st.value) or name in import_names: continue
+                if key not in installed or key in displaced: continue
+                entries.append([st.lineno, st.end_lineno, cls, name, sid(attr_reads.get(key, set()))]); kept += 1
+    visit(ast.parse(info["text"]).body, "")
+    info["scalar_attrs"] = entries
+print(f"scalar attributes with symbol-level reads: {kept}", file=sys.stderr)
+
 # Test files: their own tests, plus tests in files that import them (helpers, base classes).
 by_file = {}
 for t in T["tests"]: by_file.setdefault(t["file"], []).append(t["number"])

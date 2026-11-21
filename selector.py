@@ -93,6 +93,26 @@ def changed_old_lines(hunks):
     return removed, inserted_before
 
 # ---------- deciding tests ----------
+def scalar_literal(v):
+    if isinstance(v, ast.Constant): return True
+    if isinstance(v, ast.UnaryOp) and isinstance(v.operand, ast.Constant): return True
+    if isinstance(v, ast.Tuple): return all(scalar_literal(e) for e in v.elts)
+    return False
+
+def new_scalar_ok(tree, cls, name):
+    """In the patched file, is cls.name still assigned a scalar literal (or no longer assigned)?"""
+    body = tree.body
+    for part in cls.split("."):
+        nxt = [n for n in body if isinstance(n, ast.ClassDef) and n.name == part]
+        if len(nxt) != 1: return False
+        body = nxt[0].body
+    found = []
+    for st in body:
+        tg = st.targets if isinstance(st, ast.Assign) else [st.target] if isinstance(st, (ast.AnnAssign, ast.AugAssign)) else []
+        if any(isinstance(t, ast.Name) and t.id == name for t in tg): found.append(st)
+    if not found: return True
+    return len(found) == 1 and isinstance(found[0], (ast.Assign, ast.AnnAssign)) and found[0].value is not None and scalar_literal(found[0].value)
+
 GLOBAL_CLASS_ATTRS = {"_sql_names"}   # read at import into registries shared by every dialect
 
 def registry_change(path, old, new):
@@ -179,11 +199,22 @@ class Selector:
                 if str(x) in lines: ts |= set(self.sets[lines[str(x)]])
             return ts or None   # no line of the lambda ever ran: coverage may be incomplete, use the file level
 
+        def scalar_attr(ln):
+            """Readers of a scalar class attribute whose assignment holds ln, if the patch keeps it a
+            scalar literal (or removes it). None if ln is not such an assignment."""
+            for a, b, cls, name, set_id in info.get("scalar_attrs", []):
+                if a <= ln <= b:
+                    if new_scalar_ok(new_tree, cls, name): return set(self.sets[set_id]), f"{cls}.{name}"
+                    return None
+            return None
+
         def tests_for_stmt(st, ln=None):
             s, e, scope = st
             if scope == "m" and ln is not None and not registry:
                 lam = in_lambda(ln)
                 if lam is not None: return lam, "lambda body"
+                sa = scalar_attr(ln)
+                if sa is not None: return sa[0], f"reads of {sa[1]}"
             if scope == "m":   # runs at import: who depends on it is who uses this module's objects
                 if registry: return self.ALL, f"module-level, {registry}"
                 return mod_users, "module-level"

@@ -1,4 +1,5 @@
-output.jsonl
-__pycache__/
+.mapbuild/
 .venv/
+__pycache__/
+output.jsonl
 sqlglot/

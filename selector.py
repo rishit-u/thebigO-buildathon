@@ -668,6 +668,7 @@ def aggressive(sel, picked, paths, num_of, text=None):
 # ---------- splitting over workers ----------
 # ---------- in-container runner (fast mode) ----------
 RUNNER = True
+PROBE = None   # diagnostic builds only
 RUNNABLE_PATH = APP / "runner_pinned.json"
 _runnable = None
 NEVER_RUN = {"tests/test_generator.py::TestGenerator::test_generator_memory"}   # order/memory sensitive
@@ -755,6 +756,8 @@ def main():
                 nums = run_or_select(sel, text, nums, ms, id_of, why)
             except Exception as e:
                 why.append(f"runner error {e!r}: selection kept")
+        if PROBE == "no_tpcds": nums = {n for n in nums if id_of[n] != TPCDS_ID}
+        elif PROBE == "empty": nums = set()
         print(json.dumps({"commit": patch.stem, "workers": split(nums, ms)}))
         log(patch.stem, len(nums), "tests |", "; ".join(why))
 

@@ -167,7 +167,7 @@ def main():
                 with open(rows_path, "rb") as fh: pinned_rows = pickle.load(fh)
             except Exception:
                 pinned_rows = {}
-            if str(i) not in pinned_rows or not close(cr, pinned_rows[str(i)]):
+            if True or str(i) not in pinned_rows or not close(cr, pinned_rows[str(i)]):   # v17.4: exact digests only
                 json.dump({"ok": False, "why": f"query {i}: result changed"}, sys.stdout); return
         if spent > budget:
             json.dump({"ok": False, "why": "budget"}, sys.stdout); return

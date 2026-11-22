@@ -10,6 +10,31 @@ import os
 DATA = Path(os.environ.get("BR_DATA", "/data"))
 MAP = Path(__file__).with_name("map.json.gz")
 WORKER_MS = 2000
+TESTMAP = Path(__file__).with_name("testmap.json.gz")
+ROOTCFG = Path(__file__).with_name("rootcfg")    # the pinned commit's root config files, as shipped
+# files pytest reads as configuration: path -> its pytest section(s); new ones of these names select all
+CONFIG_FILES = {"pyproject.toml": ("tool", "pytest"), "setup.cfg": ("tool:pytest",), "tox.ini": ("pytest",),
+                ".coveragerc": (), ".coveragerc.toml": ()}
+RISKY_NAMES = {"conftest.py", "pytest.ini", ".pytest.ini", "sitecustomize.py", "usercustomize.py"}
+
+def config_unchanged_for_pytest(path, hunks):
+    """The edited config still parses and its pytest settings are the same (coverage files: always)."""
+    if path.startswith(".coveragerc"): return True    # the tests are not run under coverage when labeled
+    src = ROOTCFG / path
+    if not src.exists(): return False
+    old_text = src.read_text(encoding="utf-8"); new_text = apply(old_text, hunks)
+    try:
+        if path.endswith(".toml"):
+            import tomllib
+            o, n = tomllib.loads(old_text), tomllib.loads(new_text)
+            return o.get("tool", {}).get("pytest") == n.get("tool", {}).get("pytest") and "pytest" not in n
+        import configparser
+        def sec(t):
+            c = configparser.RawConfigParser(strict=False); c.read_string(t)
+            return {k: dict(c[k]) for k in c.sections() if "pytest" in k}
+        return sec(old_text) == sec(new_text) == {}
+    except Exception:
+        return False
 
 def log(*a): print(*a, file=sys.stderr)
 
@@ -21,9 +46,21 @@ def parse_patch(text):
     files, cur, hunk = [], None, None
     for line in text.split("\n"):
         if line.startswith("diff --git "):
-            cur = {"old": None, "new": None, "hunks": []}; files.append(cur); hunk = None
+            cur = {"old": None, "new": None, "hunks": [], "hdr": {}}; files.append(cur); hunk = None
+            m = re.match(r"diff --git a/(\S+) b/(\S+)$", line)
+            if m: cur["hdr"]["a"], cur["hdr"]["b"] = m.group(1), m.group(2)
         elif cur is None:
             continue
+        elif hunk is None and line.startswith(("rename from ", "copy from ")):
+            cur["hdr"]["rename_from"] = line.split(" ", 2)[2].strip()
+        elif hunk is None and line.startswith(("rename to ", "copy to ")):
+            cur["hdr"]["rename_to"] = line.split(" ", 2)[2].strip()
+        elif hunk is None and line.startswith("new file mode"):
+            cur["hdr"]["new_file"] = True
+        elif hunk is None and line.startswith("deleted file mode"):
+            cur["hdr"]["deleted"] = True
+        elif hunk is None and line.startswith("Binary files "):
+            cur["hdr"]["binary"] = True
         elif hunk is None and line.startswith("--- "):
             cur["old"] = None if line[4:].strip() == "/dev/null" else line[4:].strip()[2:]
         elif hunk is None and line.startswith("+++ "):
@@ -40,8 +77,13 @@ def parse_patch(text):
         else:
             hunk = None  # a git header line (rename, mode, index) between files
     for f in files:
-        if f["old"] is None and f["new"] is None:  # rename/mode-only: take names from header
-            pass
+        h = f["hdr"]
+        if f["old"] is None and f["new"] is None and not f["hunks"]:   # no ---/+++ lines: rename, mode, binary
+            if "rename_from" in h or "rename_to" in h:
+                f["old"], f["new"] = h.get("rename_from"), h.get("rename_to")
+            elif "a" in h:
+                f["old"] = None if h.get("new_file") else h["a"]
+                f["new"] = None if h.get("deleted") else h["b"]
     return files
 
 def apply(old_text, hunks):
@@ -439,17 +481,147 @@ class Selector:
 
     def select(self, patch_text):
         why, picked = [], set()
+        self.protect = set()   # tests chosen by rules that know them exactly: never dropped by the giant areas
         for f in parse_patch(patch_text):
             path = f["new"] or f["old"]
+            if f["old"] and f["new"] and f["old"] != f["new"]:     # rename/copy: the old path goes, the new one comes
+                gone = dict(f, new=None); come = dict(f, old=None)
+                parts = [self.other_file(gone, why), self.other_file(come, why)]
+                if any(x is None for x in parts):
+                    why.append(f"{f['old']} -> {f['new']}: rename -> all"); return self.ALL, why
+                picked |= parts[0] | parts[1]; continue
             if f["old"] in self.files and f["new"] == f["old"] and path.endswith(".py"):
                 picked |= self.py_source(path, f["hunks"], why)
-            elif f["old"] == f["new"] and path in self.reads:
+                continue
+            if f["old"] == f["new"] and path.startswith("tests/") and path.endswith(".py") and path in self.test_files:
+                ts = self.test_source(path, f["hunks"], why)
+                if ts is not None:
+                    picked |= ts; self.protect |= ts; continue
+            if f["old"] == f["new"] and path in self.reads and path not in CONFIG_FILES:
                 picked |= set(self.sets[self.reads[path]]); why.append(f"{path}: fixture readers")
             elif f["old"] == f["new"] and path in self.test_files:
                 picked |= set(self.sets[self.test_files[path]]); why.append(f"{path}: test file")
             else:
-                why.append(f"{path}: unknown kind of change -> all"); return self.ALL, why
+                ts = self.other_file(f, why)
+                if ts is None:
+                    why.append(f"{path}: unknown kind of change -> all"); return self.ALL, why
+                picked |= ts; self.protect |= ts
         return picked, why
+
+    # ----- test code (tests/**/*.py): per-test line coverage of the test files (testmap.json.gz) -----
+    def _tm(self):
+        if not hasattr(self, "tm"):
+            self.tm = json.loads(gzip.decompress(TESTMAP.read_bytes())) if TESTMAP.exists() else None
+        return self.tm
+
+    def test_source(self, path, hunks, why):
+        """An edit of an existing test module. Functions whose code changed select the tests that ran any
+        line of their body (that test's own body, helpers it called, setUpClass for its class). Changes
+        outside function bodies, or to code run at collection, select the module's tests and the tests of
+        modules that import it. None: not handled here (caller falls back)."""
+        tm = self._tm(); src = PINNED_DIR / path
+        if tm is None or not src.exists(): return None
+        old_text = src.read_text(encoding="utf-8")
+        module = set(self.sets[self.test_files[path]])
+        try:
+            old_tree = ast.parse(old_text); new_tree = ast.parse(apply(old_text, hunks))
+        except SyntaxError:
+            why.append(f"{path}: syntax error -> {len(module)} tests of the module and its importers"); return module
+        if ast.dump(old_tree) == ast.dump(new_tree):
+            why.append(f"{path}: same AST -> 0"); return set()
+        def collect(tree):
+            funcs = {}
+            def skel(body, prefix):
+                out = []
+                for st in body:
+                    if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        funcs[prefix + st.name] = st; out.append(("F", prefix + st.name))
+                    elif isinstance(st, ast.ClassDef):
+                        out.append(("C", prefix + st.name, ast.dump(ast.Tuple(st.bases, ast.Load())),
+                                    str([ast.dump(k) for k in st.keywords]), str([ast.dump(d) for d in st.decorator_list]),
+                                    skel(st.body, prefix + st.name + ".")))
+                    else:
+                        out.append(("S", ast.dump(st)))
+                return out
+            return skel(tree.body, ""), funcs
+        so, fo = collect(old_tree); sn, fn = collect(new_tree)
+        # new functions that cannot change what existing code does: new test methods, and new module-level
+        # functions whose name the module did not define before (and that no hook mechanism looks up)
+        old_names = {n.id for n in ast.walk(old_tree) if isinstance(n, ast.Name)} | {q.split(".")[0] for q in fo} | \
+            {a.asname or a.name.split(".")[0] for n in ast.walk(old_tree) if isinstance(n, (ast.Import, ast.ImportFrom)) for a in n.names}
+        def harmless_new(q):
+            name = q.rsplit(".", 1)[-1]
+            if "." in q: return name.startswith("test")
+            return name not in old_names and not name.startswith(("pytest_", "setup", "teardown", "setUp", "tearDown", "load_tests", "_"))
+        added_tests = {q for q in fn if q not in fo and harmless_new(q)}
+        removed = {q for q in fo if q not in fn}
+        if any("." not in q for q in removed):   # another module may import it by name
+            why.append(f"{path}: module-level function removed -> {len(module)}"); return module
+        def drop(sk, names):
+            out = []
+            for e in sk:
+                if e[0] == "F" and e[1] in names: continue
+                out.append(e[:5] + (drop(e[5], names),) if e[0] == "C" else e)
+            return out
+        if drop(so, removed) != drop(sn, added_tests):
+            why.append(f"{path}: module/class-level change -> {len(module)}"); return module
+        info = tm["files"].get(path, {"lines": {}, "import_lines": [], "unknown_lines": []})
+        at_import = set(info["import_lines"]) | set(info["unknown_lines"])
+        id_of = self._ids()
+        picked = set()
+        for q in sorted(removed | {q for q in fo if q in fn and ast.dump(fo[q]) != ast.dump(fn[q])}):
+            node = fo[q]; name = q.rsplit(".", 1)[-1]
+            body = range(node.body[0].lineno, node.end_lineno + 1)
+            if any(ln in at_import for ln in body):
+                why.append(f"{path}: {q} runs at collection -> {len(module)}"); return module
+            ts = set()
+            for ln in body:
+                k = info["lines"].get(str(ln))
+                if k is not None: ts |= set(tm["sets"][k])
+            header_changed = q in removed or ast.dump(ast.Module(fo[q].decorator_list + [fo[q].args], [])) != \
+                ast.dump(ast.Module(fn[q].decorator_list + [fn[q].args], []))
+            if q in removed or header_changed or name.startswith("test"):
+                ts |= {n for n in module if id_of.get(n, "").endswith("::" + name)}
+            picked |= ts
+            why.append(f"{path}: {q} -> {len(ts)} tests that ran it")
+        return picked
+
+    def _ids(self):
+        if not hasattr(self, "id_of"):
+            try:
+                self.id_of = {t["number"]: t["id"] for t in json.loads((DATA / "tests.json").read_text())["tests"]}
+            except Exception:
+                self.id_of = {}
+        return self.id_of
+
+    # ----- files outside the Python sources -----
+    def other_file(self, f, why):
+        """New, deleted, or edited files that are not sqlglot sources or test modules. None: select all."""
+        old, new = f["old"], f["new"]; path = new or old
+        if not path: return None
+        name = path.rsplit("/", 1)[-1]
+        if name in RISKY_NAMES or path.endswith(".pth"): return None
+        if path in CONFIG_FILES and old == new:
+            if config_unchanged_for_pytest(path, f["hunks"]):
+                why.append(f"{path}: config edit, pytest settings unchanged -> 0"); return set()
+            return None
+        if old is None:                                   # a new file
+            if path in CONFIG_FILES or path.endswith("__init__.py"): return None
+            if path.startswith("sqlglot/") and path.endswith(".py"):
+                d = path.rsplit("/", 1)[0] + "/"   # modules are imported by name; only tests that list a
+                ts = set()                          # package directory (they read its files) can see it
+                for r, k in self.reads.items():
+                    if r.startswith(d) and "/" not in r[len(d):]: ts |= set(self.sets[k])
+                why.append(f"{path}: new module -> {len(ts)} readers of its directory"); return ts
+            why.append(f"{path}: new file, nothing lists its directory -> 0"); return set()
+        if new is None:                                   # a deleted file
+            if path in self.files or (path.startswith("tests/") and path.endswith(".py")): return None
+            ts = set(self.sets[self.reads[path]]) if path in self.reads else set()
+            why.append(f"{path}: deleted -> {len(ts)} readers"); return ts
+        if path in self.reads:
+            ts = set(self.sets[self.reads[path]]); why.append(f"{path}: readers {len(ts)}"); return ts
+        if path.endswith(".py") and (path.startswith("sqlglot/") or path.startswith("tests/")): return None
+        why.append(f"{path}: no test reads or imports it -> 0"); return set()
 
 # ---------- aggressive mode (opt-in, accepts miss risk for speed) ----------
 # Keep a giant test only when the edit is in code that test specifically checks; replace
@@ -747,7 +919,7 @@ def main():
             nums, why = sel.select(text)
             if AGGRESSIVE:
                 paths = [f["new"] or f["old"] for f in parse_patch(text)]
-                if all(paths): nums = aggressive(sel, set(nums), paths, num_of, text)
+                if all(paths): nums = aggressive(sel, set(nums), paths, num_of, text) | (set(nums) & sel.protect)
         except Exception as e:  # never crash: a crash rejects the run, a wide answer only costs time
             nums, why = sel.ALL, [f"error {e!r} -> all"]
         nums = {n for n in nums if n in ms}

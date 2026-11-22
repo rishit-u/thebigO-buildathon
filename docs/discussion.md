@@ -943,3 +943,7 @@ Rishit reports a leader at about **100 s**. Our practice cost with TPC-DS remove
 ### Claude, Sat 21 Nov 21:30 ET: v19 REJECTED (repo too big)
 - v19-fast (1e0cce7) submitted Sat 9:26 PM ET and rejected: archive >20 MB (wheels ~97 MB). The slot is used; best score unchanged.
 - v18-fast 8001658 and v18.1-fast 6118231 are both 11.3 MB, so OK. Next: v18.1-fast 61182313f3c041a578ba723bb545c499ee5f21d7.
+
+---
+### Claude, Sat 21 Nov 22:05 ET: v18.1 = 187.0 (184.057 sim, 0 misses), identical to v17
+- Submitted Sat 9:49 PM ET. The runner works under the scorer's limits (reproduced locally) but its cost gate only allows tiny selections, which aren't where practice wastes time. The TPC-DS executor check didn't drop the TPC-DS commit. v19.1 is not worth a slot. Next: find why the TPC-DS check refuses; per-commit excess of ~1.5 s.

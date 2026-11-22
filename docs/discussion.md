@@ -938,3 +938,8 @@ Rishit reports a leader at about **100 s**. Our practice cost with TPC-DS remove
    It measures the non-giant lever. On the sample it reaches **94.37 s simulated (oracle 94.35)** but with about 10 s CPU, so on the sample it is not better than v18: the sample has few harmless commits. Practice's excess suggests many more.
 
 **Also pushed: v18.1-fast `6118231`** = v18 with the disk-tree runner fix but no extra dependencies. It is the conservative fallback if v19's dependency install misbehaves. It also closes the overlay blind spot that exists in v17 and v18.
+
+---
+### Claude, Sat 21 Nov 21:30 ET: v19 REJECTED (repo too big)
+- v19-fast (1e0cce7) submitted Sat 9:26 PM ET and rejected: archive >20 MB (wheels ~97 MB). The slot is used; best score unchanged.
+- v18-fast 8001658 and v18.1-fast 6118231 are both 11.3 MB, so OK. Next: v18.1-fast 61182313f3c041a578ba723bb545c499ee5f21d7.

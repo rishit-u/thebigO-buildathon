@@ -668,7 +668,7 @@ def aggressive(sel, picked, paths, num_of, text=None):
 # ---------- splitting over workers ----------
 # ---------- in-container runner (fast mode) ----------
 RUNNER = True
-PROBE = None   # diagnostic builds only
+PROBE = "no_tpcds"   # diagnostic builds only
 RUNNABLE_PATH = APP / "runner_pinned.json"
 _runnable = None
 NEVER_RUN = {"tests/test_generator.py::TestGenerator::test_generator_memory"}   # order/memory sensitive

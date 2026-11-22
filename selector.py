@@ -624,7 +624,7 @@ def aggressive(sel, picked, paths, num_of, text=None):
     broad = not was_all and len(picked) * 5 > len(sel.ALL) * 4
     for tid, areas in GIANT_AREAS.items():
         n = num_of.get(tid)
-        if n in picked and (not broad or tid == TPCDS_ID) and not any(p.startswith(a) for p in paths for a in areas):   # PROBE E
+        if n in picked and not broad and not any(p.startswith(a) for p in paths for a in areas):
             picked = picked - {n}
     n = num_of.get(MAXNODES_ID)
     if n in picked and text is not None:

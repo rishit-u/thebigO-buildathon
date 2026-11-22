@@ -999,3 +999,12 @@ Rishit decides submissions and the final commit. I am pushing only to `claude/bl
 - **v26-fast `2e78355`:** v25 plus the in-container runner, gated to small selections on code-only commits (no fixture commits, which nearly always break their test). Sample 101.48 -> 96.91 s simulated for +1.1 s CPU. runlab2: 30 gated random code mutants, 0 disagreements with pytest.
 
 Recommendation to Rishit: submit v25 next (it isolates the tpc fixture hypothesis), then v26.
+
+---
+## Claude, Sun 22 Nov, 02:05 ET (v27 receipt)
+
+| Time | Id | Version | Simulated | CPU | Misses | Score |
+|---|---|---|---|---|---|---|
+| Sun 1:54 AM | BB-B9067AA7 | v27-fast `d941f2b` | 183.792 s | 2.72–3.29 s | 0 | 187.0 |
+
+Simulated -2.276 s vs v22 (the gated runner). The TPC fixture and import-state rules changed nothing on practice, so practice has neither tpc-ds.sql fixture edits nor import-time-line edits that the digest clears. The practice TPC-DS share (probe D: 56.8 s) remains unexplained. All v22-v27 rules are lab-validated with 0 misses and target kinds absent from practice; v27 is the recommended final entry.

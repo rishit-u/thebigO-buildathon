@@ -9,7 +9,7 @@ All equal: the test's comparisons see exactly what they saw on the pinned commit
 Usage: python -I tpcds_res.py <dir with sqlglot/> <tpcds_spec.json> <pinned stage hashes> <pinned results> <data dir> [--build]
   --build: print the pinned results ({query: digest}) instead of checking.
 """
-import csv, enum, gzip, hashlib, json, math, pickle, sys, time
+import csv, enum, gzip, hashlib, json, math, os, pickle, sys, time
 import ast as _ast
 
 
@@ -103,14 +103,36 @@ def main():
                 rows.append(tuple(None if (t is not str and v == "") else t(v) for t, v in zip(ctypes, row)))
             out[table] = Table(columns=columns, rows=rows)
         return out
-    def result_digest(e):
+    def result_rows(e):
         tb = {t.name: tables[t.name] for t in find_tables(e)}
         r = execute(e, schema=schema, tables=tb)
-        return hashlib.blake2b(repr((list(r.columns), list(r.rows))).encode(), digest_size=16).hexdigest()
+        return (list(r.columns), [tuple(x) for x in r.rows])
+    def res_digest(cr):
+        return hashlib.blake2b(repr(cr).encode(), digest_size=16).hexdigest()
+    def result_digest(e):
+        return res_digest(result_rows(e))
+    rows_path = os.path.join(os.path.dirname(os.path.abspath(sys.argv[2])), "tpcds_rows.pkl")
+    def close(a, b):
+        """Rows equal, floats within 1e-9 relative (far tighter than assert_frame_equal's 1e-5):
+        operation-order noise in an otherwise identical result."""
+        if a[0] != b[0] or len(a[1]) != len(b[1]): return False
+        for ra, rb in zip(a[1], b[1]):
+            if len(ra) != len(rb): return False
+            for x, y in zip(ra, rb):
+                if x == y or (x != x and y != y): continue
+                if isinstance(x, float) and isinstance(y, (int, float)) and not isinstance(y, bool) \
+                        and math.isclose(x, y, rel_tol=1e-9, abs_tol=1e-12): continue
+                if isinstance(y, float) and isinstance(x, (int, float)) and not isinstance(x, bool) \
+                        and math.isclose(x, y, rel_tol=1e-9, abs_tol=1e-12): continue
+                return False
+        return True
     if build:
-        tables = load_tables(); out = {}
+        tables = load_tables(); out = {}; rows = {}
         for i, (execute_flag, sql) in enumerate(spec["queries"]):
-            if execute_flag: out[str(i)] = result_digest(pickle.loads(pickle.dumps(parse_one(sql))))
+            if execute_flag:
+                rows[str(i)] = result_rows(pickle.loads(pickle.dumps(parse_one(sql))))
+                out[str(i)] = res_digest(rows[str(i)])
+        with open(rows_path, "wb") as fh: pickle.dump(rows, fh)
         json.dump(out, sys.stdout); return
     pinned_res = json.load(open(pinned_res_path))
     budget = 6.0; spent = 0.0; ran = 0
@@ -136,12 +158,17 @@ def main():
         if tables is None: tables = load_tables()
         t0 = time.process_time()
         try:
-            d = result_digest(pickle.loads(pickle.dumps(parse_one(sql))))
+            cr = result_rows(pickle.loads(pickle.dumps(parse_one(sql))))
         except Exception as ex:
             json.dump({"ok": False, "why": f"query {i}: executor {type(ex).__name__}"}, sys.stdout); return
         spent += time.process_time() - t0; ran += 1
-        if d != pinned_res.get(str(i)):
-            json.dump({"ok": False, "why": f"query {i}: result changed"}, sys.stdout); return
+        if res_digest(cr) != pinned_res.get(str(i)):
+            try:
+                with open(rows_path, "rb") as fh: pinned_rows = pickle.load(fh)
+            except Exception:
+                pinned_rows = {}
+            if True or str(i) not in pinned_rows or not close(cr, pinned_rows[str(i)]):   # v17.4: exact digests only
+                json.dump({"ok": False, "why": f"query {i}: result changed"}, sys.stdout); return
         if spent > budget:
             json.dump({"ok": False, "why": "budget"}, sys.stdout); return
     json.dump({"ok": True, "ran": ran}, sys.stdout)

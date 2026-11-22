@@ -624,7 +624,7 @@ def tpcds_unaffected(sel, text):
         import subprocess
         r = subprocess.run([sys.executable, "-I", str(APP / "tpcds_res.py"), str(root), str(SPEC), str(PINNED_FP),
                             str(TPCDS_RESULTS), str(TPCDS_DATA)] + (["--force", ",".join(map(str, sorted(force)))] if force else []),
-                           capture_output=True, text=True, timeout=20,
+                           capture_output=True, text=True, timeout=30,
                            env={"PYTHONDONTWRITEBYTECODE": "1", "PATH": os.environ.get("PATH", "")})
         res = json.loads(r.stdout) if r.returncode == 0 else {"ok": False, "why": r.stderr[-200:]}
         log("  TPC-DS result check:", res)

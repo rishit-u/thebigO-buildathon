@@ -18,6 +18,7 @@ def main():
     pinned = json.load(open(sys.argv[3])); pinned_res_path = sys.argv[4]; data = sys.argv[5]
     build = "--build" in sys.argv
     force = set(int(x) for x in sys.argv[sys.argv.index("--force") + 1].split(",")) if "--force" in sys.argv else set()
+    only = set(int(x) for x in sys.argv[sys.argv.index("--only") + 1].split(",")) if "--only" in sys.argv else None
 
     sys.path.insert(0, root)
     import unittest  # noqa: F401  -- the test suite runs with UNITTEST on (expressions/core.py)
@@ -91,9 +92,14 @@ def main():
     from sqlglot.executor import execute
     from sqlglot.executor.table import Table
     tables = None
+    class _LazyTables(dict):
+        """Each table is read from its CSV the first time a query needs it."""
+        def __missing__(self, table):
+            self[table] = _load_table(table, schema[table]); return self[table]
     def load_tables():
-        out = {}
-        for table, columns in schema.items():
+        return _LazyTables()
+    def _load_table(table, columns):
+        if True:
             reader = csv.reader(gzip.open(f"{data}/{table}.csv.gz", "rt", newline=""), delimiter="|")
             next(reader); rows = []; ctypes = []
             for row in reader:
@@ -102,8 +108,7 @@ def main():
                         try: ctypes.append(type(_ast.literal_eval(v)))
                         except (ValueError, SyntaxError): ctypes.append(str)
                 rows.append(tuple(None if (t is not str and v == "") else t(v) for t, v in zip(ctypes, row)))
-            out[table] = Table(columns=columns, rows=rows)
-        return out
+            return Table(columns=columns, rows=rows)
     def result_rows(e):
         tb = {t.name: tables[t.name] for t in find_tables(e)}
         r = execute(e, schema=schema, tables=tb)
@@ -122,17 +127,20 @@ def main():
     def duck_conn():
         if duck[0] is None:
             import duckdb
-            c = duckdb.connect(config={"threads": 1})
-            for table, columns in schema.items():
+            duck[0] = duckdb.connect(config={"threads": 1}); duck.append(set())
+        return duck[0]
+    def duck_digest(sql):
+        import re as _re
+        c = duck_conn()
+        for table, columns in schema.items():   # only the tables the query can name (lazily, once)
+            if table not in duck[1] and _re.search(rf"\b{table}\b", sql, _re.I):
                 c.execute(f"""
                 CREATE TABLE {table} AS
                 SELECT *
                 FROM READ_CSV('{data}/{table}.csv.gz', delim='|', header=True, columns={columns})
                 """)
-            duck[0] = c
-        return duck[0]
-    def duck_digest(sql):
-        df = duck_conn().execute(transpile(sql, write="duckdb")[0]).fetchdf()
+                duck[1].add(table)
+        df = c.execute(transpile(sql, write="duckdb")[0]).fetchdf()
         return hashlib.blake2b(repr((list(df.columns), [str(t) for t in df.dtypes], df.values.tolist())).encode(),
                                digest_size=16).hexdigest()
     def close(a, b):
@@ -167,6 +175,7 @@ def main():
     pinned_res = json.load(open(pinned_res_path))
     budget = 12.0; spent = 0.0; ran = 0; duck_ran = 0
     for i, (execute_flag, sql) in enumerate(spec["queries"]):
+        if only is not None and i not in only: continue    # fixture check: unchanged queries need nothing
         try:
             e = parse_one(sql)
             row = [eh(e)]

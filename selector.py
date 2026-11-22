@@ -34,6 +34,52 @@ def fixture_pairs(text):
             sql = "\n".join(sql_lines[j:])
             yield meta, sql, statements[i + 1].strip()
 
+def tpcds_fixture_same(po, pn, changed, why):
+    """tpcds_res.py on the pinned sqlglot with the patched queries (only those): every changed query must
+    parse, and an executed one must give the pinned executor result digest and the pinned DuckDB frame
+    digest. Then test_execute_tpcds sees exactly what it saw on the pinned commit."""
+    import shutil, subprocess, tempfile
+    if not (SPEC.exists() and PINNED_FP.exists() and TPCDS_RESULTS.exists() and (APP / "tpcds_duck.json").exists()):
+        return False
+    if any(bool(po[i][0].get("execute")) != bool(pn[i][0].get("execute")) for i in changed): return False
+    spec = json.loads(SPEC.read_text())
+    if len(spec["queries"]) != len(po) or any(spec["queries"][i][1] != po[i][1] for i in changed): return False
+    for i in changed: spec["queries"][i] = [bool(pn[i][0].get("execute")), pn[i][1]]
+    d = Path(tempfile.mkdtemp(prefix="brfx", dir="/tmp"))
+    try:
+        (d / "tpcds_spec.json").write_text(json.dumps(spec))
+        for name in ("tpcds_duck.json", "tpcds_rows.pkl"):
+            if (APP / name).exists(): os.symlink(APP / name, d / name)
+        cap = min(TPCDS_CPU_MAX, TPCDS_CPU_SHARE * 21.0)
+        r = subprocess.run([sys.executable, "-I", str(APP / "tpcds_res.py"), str(PINNED_DIR), str(d / "tpcds_spec.json"),
+                            str(PINNED_FP), str(TPCDS_RESULTS), str(TPCDS_DATA), "--only", ",".join(map(str, changed))],
+                           capture_output=True, text=True, timeout=2 * cap + 5, preexec_fn=lambda: _cpu_limit(cap),
+                           env={"PYTHONDONTWRITEBYTECODE": "1", "PATH": os.environ.get("PATH", ""), "HOME": "/tmp"})
+        res = json.loads(r.stdout) if r.returncode == 0 else {"ok": False, "why": f"rc {r.returncode}"}
+    except Exception as e:
+        res = {"ok": False, "why": repr(e)[:80]}
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    why.append(f"TPC-DS fixture query check {sorted(changed)}: {res}")
+    return res.get("ok") is True
+
+STATE_PINNED = Path(__file__).resolve().parent / "state_pinned.txt"
+
+def state_digest(changed, cap=4.0):
+    """Digest of sqlglot's import-time state with these files patched (PYTHONHASHSEED fixed: the state
+    itself depends on set iteration order). '' on any failure."""
+    import shutil, subprocess, tempfile
+    root = Path(tempfile.mkdtemp(prefix="brst", dir="/tmp"))
+    try:
+        link_tree(PINNED_DIR, root, changed) if changed else None
+        r = subprocess.run([sys.executable, "-s", str(APP / "statedigest.py"), str(root if changed else PINNED_DIR)],
+                           capture_output=True, text=True, timeout=4 * cap + 5, preexec_fn=lambda: _cpu_limit(cap),
+                           env={"PYTHONHASHSEED": "0", "PYTHONDONTWRITEBYTECODE": "1", "PATH": os.environ.get("PATH", ""),
+                                "HOME": "/tmp"}, cwd="/tmp")
+        return r.stdout.strip().split("\n")[-1] if r.returncode == 0 else ""
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
 def parses(sqls):
     """parse_one on each SQL string, with the pinned sqlglot, in a child process (pickled as the pool does)."""
     import subprocess
@@ -482,7 +528,11 @@ class Selector:
                     if cr is not None: return cr
                 return mod_users, "module-level"
             if any(ln in import_lines for ln in range(s, e + 1)):
-                return self.ALL, "runs at import"   # e.g. metaclasses, factories called in class bodies
+                # e.g. metaclasses, factories called in class bodies, SQL parsed into module constants:
+                # if everything the patched package builds at import is identical, only test-time runs matter
+                if not (AGGRESSIVE and self.import_state_same()):
+                    return self.ALL, "runs at import"
+                why.append(f"{path}:{s} runs at import, import-time state unchanged")
             ts = set()
             for ln in range(s, e + 1):
                 if str(ln) in lines: ts |= set(self.sets[lines[str(ln)]])
@@ -512,9 +562,22 @@ class Selector:
         why.append(f"{path}: {len(picked)} tests")
         return picked | readers
 
+    def import_state_same(self):
+        """statedigest.py on the patched package equals the pinned digest (cached per patch)."""
+        if self._state_same is None:
+            self._state_same = False
+            try:
+                if STATE_PINNED.exists() and PINNED_DIR.exists():
+                    changed = {f["new"]: apply(self.files[f["new"]]["text"], f["hunks"]) for f in self._cur_files
+                               if f["new"] and f["old"] == f["new"] and f["new"] in self.files}
+                    self._state_same = state_digest(changed) == STATE_PINNED.read_text().strip()
+            except Exception as e:
+                log("  import-state check failed:", repr(e)[:150])
+        return self._state_same
+
     def select(self, patch_text):
         why, picked = [], set()
-        self.protect = set()   # tests chosen by rules that know them exactly: never dropped by the giant areas
+        self.protect = set(); self._state_same = None; self._cur_files = parse_patch(patch_text)   # tests chosen by rules that know them exactly: never dropped by the giant areas
         for f in parse_patch(patch_text):
             path = f["new"] or f["old"]
             if f["old"] and f["new"] and f["old"] != f["new"]:     # rename/copy: the old path goes, the new one comes
@@ -561,7 +624,9 @@ class Selector:
         if len(po) != len(pn):
             why.append(f"{path}: pairs {len(po)} -> {len(pn)} -> {len(readers)} readers"); return readers
         ds = "tpc-ds" in path
-        ms_changed = [i for i, (a, b) in enumerate(zip(po, pn)) if a[:2] != b[:2]]
+        # mp_execute reads meta only as `if not meta.get("execute")`
+        ms_changed = [i for i, (a, b) in enumerate(zip(po, pn))
+                      if (bool(a[0].get("execute")), a[1]) != (bool(b[0].get("execute")), b[1])]
         sq_changed = [i for i, (a, b) in enumerate(zip(po, pn)) if a[1:] != b[1:]]
         keep = set()
         for n in readers:
@@ -569,9 +634,11 @@ class Selector:
             if not tid.startswith("tests/test_executor.py::TestExecutor::"): keep.add(n); continue
             name = tid.rsplit("::", 1)[-1]
             if ds and name == "test_execute_tpcds" and ms_changed:
-                # a changed query that is not executed matters only if parse_one fails on it
-                if any(po[i][0].get("execute") or pn[i][0].get("execute") for i in ms_changed) or \
-                        not parses([pn[i][1] for i in ms_changed]):
+                # a changed query that is not executed matters only if parse_one fails on it; an executed
+                # one only if the executor rows or the DuckDB frame of its new SQL differ from the pinned
+                if any(po[i][0].get("execute") or pn[i][0].get("execute") for i in ms_changed):
+                    if not tpcds_fixture_same(po, pn, ms_changed, why): keep.add(n)
+                elif not parses([pn[i][1] for i in ms_changed]):
                     keep.add(n)
             elif not ds and name == "test_execute_tpch" and ms_changed: keep.add(n)
             elif not ds and name == "test_optimized_tpch" and sq_changed: keep.add(n)
@@ -800,6 +867,9 @@ def build_pinned(sel):
         # runnable tests for the runner (normally shipped prebuilt: running the suite twice is slow)
         import runner
         runner.build(str(APP / "tests.json")); log("runner: runnable tests", len(json.loads(RUNNABLE_PATH.read_text())))
+    sa, sb = state_digest({}, 60), state_digest({}, 60)
+    if sa and sa == sb: STATE_PINNED.write_text(sa); log("pinned import-state digest:", sa)
+    else: log("import-state digest not reproducible: check off", sa, sb)
     a, b = run_script("maxnodes_fp.py", PINNED_DIR, 300), run_script("maxnodes_fp.py", PINNED_DIR, 300)
     if a != b: log("pinned max_nodes results are not deterministic: check off"); return
     MAXNODES_PINNED.write_text(json.dumps(a)); log("pinned max_nodes results:", len(a))

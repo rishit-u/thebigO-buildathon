@@ -581,7 +581,9 @@ def tpcds_checkable(sel, files):
             for fn in tops:   # outermost function whose body holds ln
                 if fn.body[0].lineno <= ln <= fn.end_lineno and (outer is None or fn.lineno < outer.lineno):
                     outer = fn
-            if outer is None: return False                        # module or class level
+            if outer is None:                                     # module or class level: the check imports
+                if bad: return False                              # the patched package afresh, so this is
+                continue                                          # covered unless the file has executor code
             span = set(range(outer.lineno, outer.end_lineno + 1))
             if span & bad: return False                           # runs in the executor/comparison
     return True

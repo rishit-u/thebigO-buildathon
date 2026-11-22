@@ -297,10 +297,13 @@ class Selector:
                                 out[(qq, x.targets[0].id)] = x
                         walk(st.body, qq)
             walk(tree.body, ""); return out
-        def stripped(tree):
-            t = copy.deepcopy(tree)
-            for x in entries(t).values(): x.value.values = [ast.Constant(None) for _ in x.value.values]
-            return ast.dump(t)
+        def stripped(tree):   # ast.dump with every class-body dict's values blanked (in place, then restored)
+            saved = [(x, x.value.values) for x in entries(tree).values()]
+            try:
+                for x, v in saved: x.value.values = [ast.Constant(None) for _ in v]
+                return ast.dump(tree)
+            finally:
+                for x, v in saved: x.value.values = v
         old_e, new_e = entries(old_tree), entries(new_tree)
         if not old_e or stripped(old_tree) != stripped(new_tree): return None
         D, groups, gof = self.m["dicts"], self.m["dict_groups"], self.m["dict_group_of"]
@@ -742,13 +745,11 @@ def run_script(script, root, timeout=8):   # normal run ~1 s; a hang must not bu
 def patched_tree(sel, files):
     import shutil, tempfile
     root = Path(tempfile.mkdtemp(prefix="brfp", dir="/tmp"))
-    if PINNED_DIR.exists(): shutil.copytree(PINNED_DIR, root, dirs_exist_ok=True)
-    else: write_tree(sel, root)
-    for f in files:
-        p = root / f["new"]
-        p.write_text(apply(sel.files[f["new"]]["text"], f["hunks"]), encoding="utf-8")
-        pyc = p.parent / "__pycache__"
-        for c in (pyc.glob(p.stem + ".*.pyc") if pyc.exists() else []): c.unlink()
+    changed = {f["new"]: apply(sel.files[f["new"]]["text"], f["hunks"]) for f in files}
+    if PINNED_DIR.exists(): link_tree(PINNED_DIR, root, changed)   # symlinks: no copy of the pinned tree
+    else:
+        write_tree(sel, root)
+        for rel, txt in changed.items(): (root / rel).write_text(txt, encoding="utf-8")
     return root
 
 def body_only(sel, files):
@@ -862,15 +863,9 @@ def tpcds_unaffected(sel, text, worth=21.0):
     files = parse_patch(text)
     force = tpcds_checkable(sel, files)
     if force is None: return False
-    import shutil, tempfile
-    root = Path(tempfile.mkdtemp(prefix="brfp", dir="/tmp"))
+    import shutil
+    root = patched_tree(sel, files)
     try:
-        if PINNED_DIR.exists(): shutil.copytree(PINNED_DIR, root, dirs_exist_ok=True)
-        for f in files:
-            p = root / f["new"]
-            p.write_text(apply(sel.files[f["new"]]["text"], f["hunks"]), encoding="utf-8")
-            pyc = p.parent / "__pycache__"
-            for c in (pyc.glob(p.stem + ".*.pyc") if pyc.exists() else []): c.unlink()
         import subprocess
         r = subprocess.run([sys.executable, "-I", str(APP / "tpcds_res.py"), str(root), str(SPEC), str(PINNED_FP),
                             str(TPCDS_RESULTS), str(TPCDS_DATA)] + (["--force", ",".join(map(str, sorted(force)))] if force else []),

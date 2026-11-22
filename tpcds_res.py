@@ -18,6 +18,7 @@ def main():
     pinned = json.load(open(sys.argv[3])); pinned_res_path = sys.argv[4]; data = sys.argv[5]
     build = "--build" in sys.argv
     force = set(int(x) for x in sys.argv[sys.argv.index("--force") + 1].split(",")) if "--force" in sys.argv else set()
+    only = set(int(x) for x in sys.argv[sys.argv.index("--only") + 1].split(",")) if "--only" in sys.argv else None
 
     sys.path.insert(0, root)
     import unittest  # noqa: F401  -- the test suite runs with UNITTEST on (expressions/core.py)
@@ -91,9 +92,14 @@ def main():
     from sqlglot.executor import execute
     from sqlglot.executor.table import Table
     tables = None
+    class _LazyTables(dict):
+        """Each table is read from its CSV the first time a query needs it."""
+        def __missing__(self, table):
+            self[table] = _load_table(table, schema[table]); return self[table]
     def load_tables():
-        out = {}
-        for table, columns in schema.items():
+        return _LazyTables()
+    def _load_table(table, columns):
+        if True:
             reader = csv.reader(gzip.open(f"{data}/{table}.csv.gz", "rt", newline=""), delimiter="|")
             next(reader); rows = []; ctypes = []
             for row in reader:
@@ -102,8 +108,7 @@ def main():
                         try: ctypes.append(type(_ast.literal_eval(v)))
                         except (ValueError, SyntaxError): ctypes.append(str)
                 rows.append(tuple(None if (t is not str and v == "") else t(v) for t, v in zip(ctypes, row)))
-            out[table] = Table(columns=columns, rows=rows)
-        return out
+            return Table(columns=columns, rows=rows)
     def result_rows(e):
         tb = {t.name: tables[t.name] for t in find_tables(e)}
         r = execute(e, schema=schema, tables=tb)
@@ -113,6 +118,31 @@ def main():
     def result_digest(e):
         return res_digest(result_rows(e))
     rows_path = os.path.join(os.path.dirname(os.path.abspath(sys.argv[2])), "tpcds_rows.pkl")
+    duck_path = os.path.join(os.path.dirname(os.path.abspath(sys.argv[2])), "tpcds_duck.json")
+    # v20: the test's expected side is DuckDB running transpile(sql, write="duckdb")[0]. When that SQL
+    # changes, run it on DuckDB (installed at image build) over the same TPC-DS CSVs, exactly as the
+    # test's setUpClass loads them, and compare the whole result frame (columns, dtypes, values) with the
+    # pinned frame. Identical frames: the test's assert_frame_equal sees exactly what it saw before.
+    duck = [None]
+    def duck_conn():
+        if duck[0] is None:
+            import duckdb
+            duck[0] = duckdb.connect(config={"threads": 1}); duck.append(set())
+        return duck[0]
+    def duck_digest(sql):
+        import re as _re
+        c = duck_conn()
+        for table, columns in schema.items():   # only the tables the query can name (lazily, once)
+            if table not in duck[1] and _re.search(rf"\b{table}\b", sql, _re.I):
+                c.execute(f"""
+                CREATE TABLE {table} AS
+                SELECT *
+                FROM READ_CSV('{data}/{table}.csv.gz', delim='|', header=True, columns={columns})
+                """)
+                duck[1].add(table)
+        df = c.execute(transpile(sql, write="duckdb")[0]).fetchdf()
+        return hashlib.blake2b(repr((list(df.columns), [str(t) for t in df.dtypes], df.values.tolist())).encode(),
+                               digest_size=16).hexdigest()
     def close(a, b):
         """Rows equal, floats within 1e-9 relative (far tighter than assert_frame_equal's 1e-5):
         operation-order noise in an otherwise identical result."""
@@ -134,10 +164,18 @@ def main():
                 rows[str(i)] = result_rows(pickle.loads(pickle.dumps(parse_one(sql))))
                 out[str(i)] = res_digest(rows[str(i)])
         with open(rows_path, "wb") as fh: pickle.dump(rows, fh)
+        try:
+            dd = {str(i): duck_digest(sql) for i, (execute_flag, sql) in enumerate(spec["queries"]) if execute_flag}
+            dd2 = {str(i): duck_digest(sql) for i, (execute_flag, sql) in enumerate(spec["queries"]) if execute_flag}
+            if dd == dd2:
+                with open(duck_path, "w") as fh: json.dump(dd, fh)
+        except Exception:
+            pass                                           # no DuckDB here: a changed DuckDB SQL keeps the test
         json.dump(out, sys.stdout); return
     pinned_res = json.load(open(pinned_res_path))
-    budget = 6.0; spent = 0.0; ran = 0
+    budget = 12.0; spent = 0.0; ran = 0; duck_ran = 0
     for i, (execute_flag, sql) in enumerate(spec["queries"]):
+        if only is not None and i not in only: continue    # fixture check: unchanged queries need nothing
         try:
             e = parse_one(sql)
             row = [eh(e)]
@@ -155,7 +193,20 @@ def main():
         if pinned.get(str(i)) == row and i not in force: continue
         if not execute_flag: continue                      # only parsed by the test: no error is enough
         if row[2] != pinned[str(i)][2]:
-            json.dump({"ok": False, "why": f"query {i}: DuckDB SQL changed"}, sys.stdout); return
+            if not os.path.exists(duck_path):
+                json.dump({"ok": False, "why": f"query {i}: DuckDB SQL changed"}, sys.stdout); return
+            t0 = time.process_time()
+            try:
+                same = duck_digest(sql) == json.load(open(duck_path)).get(str(i))
+            except Exception as ex:
+                json.dump({"ok": False, "why": f"query {i}: DuckDB {type(ex).__name__}"}, sys.stdout); return
+            spent += time.process_time() - t0; duck_ran += 1
+            if not same:
+                json.dump({"ok": False, "why": f"query {i}: DuckDB result changed"}, sys.stdout); return
+            if spent > budget:
+                json.dump({"ok": False, "why": "budget"}, sys.stdout); return
+            if row[:2] + row[3:] == pinned[str(i)][:2] + pinned[str(i)][3:] and i not in force:
+                continue                                   # only the expected side's SQL changed, same frame
         if tables is None: tables = load_tables()
         t0 = time.process_time()
         try:
@@ -172,7 +223,7 @@ def main():
                 json.dump({"ok": False, "why": f"query {i}: result changed"}, sys.stdout); return
         if spent > budget:
             json.dump({"ok": False, "why": "budget"}, sys.stdout); return
-    json.dump({"ok": True, "ran": ran}, sys.stdout)
+    json.dump({"ok": True, "ran": ran, "duck": duck_ran}, sys.stdout)
 
 
 if __name__ == "__main__":

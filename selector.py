@@ -10,6 +10,107 @@ import os
 DATA = Path(os.environ.get("BR_DATA", "/data"))
 MAP = Path(__file__).with_name("map.json.gz")
 WORKER_MS = 2000
+TESTMAP = Path(__file__).with_name("testmap.json.gz")
+ROOTCFG = Path(__file__).with_name("rootcfg")    # the pinned commit's root config files, as shipped
+# files pytest reads as configuration: path -> its pytest section(s); new ones of these names select all
+CONFIG_FILES = {"pyproject.toml": ("tool", "pytest"), "setup.cfg": ("tool:pytest",), "tox.ini": ("pytest",),
+                ".coveragerc": (), ".coveragerc.toml": ()}
+RISKY_NAMES = {"conftest.py", "pytest.ini", ".pytest.ini", "sitecustomize.py", "usercustomize.py"}
+
+TPC_FIXTURES = {"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql", "tests/fixtures/optimizer/tpc-h/tpc-h.sql"}
+
+def fixture_pairs(text):
+    """tests/helpers.py load_sql_fixture_pairs (with _filter_comments, _extract_meta), on a string."""
+    statements = "\n".join([line for line in text.splitlines() if line and not line.startswith("--")]).split(";")
+    size = len(statements)
+    for i in range(0, size, 2):
+        if i + 1 < size:
+            sql = statements[i].strip()
+            meta = {}; sql_lines = sql.split("\n"); j = 0
+            while sql_lines[j].startswith("#"):
+                key, val = sql_lines[j].split(":", maxsplit=1)
+                meta[key.lstrip("#").strip()] = val.strip()
+                j += 1
+            sql = "\n".join(sql_lines[j:])
+            yield meta, sql, statements[i + 1].strip()
+
+def tpcds_fixture_same(po, pn, changed, why):
+    """tpcds_res.py on the pinned sqlglot with the patched queries (only those): every changed query must
+    parse, and an executed one must give the pinned executor result digest and the pinned DuckDB frame
+    digest. Then test_execute_tpcds sees exactly what it saw on the pinned commit."""
+    import shutil, subprocess, tempfile
+    if not (SPEC.exists() and PINNED_FP.exists() and TPCDS_RESULTS.exists() and (APP / "tpcds_duck.json").exists()):
+        return False
+    if any(bool(po[i][0].get("execute")) != bool(pn[i][0].get("execute")) for i in changed): return False
+    spec = json.loads(SPEC.read_text())
+    if len(spec["queries"]) != len(po) or any(spec["queries"][i][1] != po[i][1] for i in changed): return False
+    for i in changed: spec["queries"][i] = [bool(pn[i][0].get("execute")), pn[i][1]]
+    d = Path(tempfile.mkdtemp(prefix="brfx", dir="/tmp"))
+    try:
+        (d / "tpcds_spec.json").write_text(json.dumps(spec))
+        for name in ("tpcds_duck.json", "tpcds_rows.pkl"):
+            if (APP / name).exists(): os.symlink(APP / name, d / name)
+        cap = min(TPCDS_CPU_MAX, TPCDS_CPU_SHARE * 21.0)
+        r = subprocess.run([sys.executable, "-I", str(APP / "tpcds_res.py"), str(PINNED_DIR), str(d / "tpcds_spec.json"),
+                            str(PINNED_FP), str(TPCDS_RESULTS), str(TPCDS_DATA), "--only", ",".join(map(str, changed))],
+                           capture_output=True, text=True, timeout=2 * cap + 5, preexec_fn=lambda: _cpu_limit(cap),
+                           env={"PYTHONDONTWRITEBYTECODE": "1", "PATH": os.environ.get("PATH", ""), "HOME": "/tmp"})
+        res = json.loads(r.stdout) if r.returncode == 0 else {"ok": False, "why": f"rc {r.returncode}"}
+    except Exception as e:
+        res = {"ok": False, "why": repr(e)[:80]}
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    why.append(f"TPC-DS fixture query check {sorted(changed)}: {res}")
+    return res.get("ok") is True
+
+STATE_PINNED = Path(__file__).resolve().parent / "state_pinned.txt"
+
+def state_digest(changed, cap=4.0):
+    """Digest of sqlglot's import-time state with these files patched (PYTHONHASHSEED fixed: the state
+    itself depends on set iteration order). '' on any failure."""
+    import shutil, subprocess, tempfile
+    root = Path(tempfile.mkdtemp(prefix="brst", dir="/tmp"))
+    try:
+        link_tree(PINNED_DIR, root, changed) if changed else None
+        r = subprocess.run([sys.executable, "-s", str(APP / "statedigest.py"), str(root if changed else PINNED_DIR)],
+                           capture_output=True, text=True, timeout=4 * cap + 5, preexec_fn=lambda: _cpu_limit(cap),
+                           env={"PYTHONHASHSEED": "0", "PYTHONDONTWRITEBYTECODE": "1", "PATH": os.environ.get("PATH", ""),
+                                "HOME": "/tmp"}, cwd="/tmp")
+        return r.stdout.strip().split("\n")[-1] if r.returncode == 0 else ""
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+def parses(sqls):
+    """parse_one on each SQL string, with the pinned sqlglot, in a child process (pickled as the pool does)."""
+    import subprocess
+    code = ("import sys, json, pickle; sys.path.insert(0, sys.argv[1]); from sqlglot import parse_one\n"
+            "for q in json.load(sys.stdin): pickle.loads(pickle.dumps(parse_one(q)))\nprint('ok')")
+    try:
+        r = subprocess.run([sys.executable, "-I", "-c", code, str(PINNED_DIR)], input=json.dumps(sqls),
+                           capture_output=True, text=True, timeout=20,
+                           env={"PYTHONDONTWRITEBYTECODE": "1", "PATH": os.environ.get("PATH", ""), "HOME": "/tmp"})
+        return r.returncode == 0 and r.stdout.strip() == "ok"
+    except Exception:
+        return False
+
+def config_unchanged_for_pytest(path, hunks):
+    """The edited config still parses and its pytest settings are the same (coverage files: always)."""
+    if path.startswith(".coveragerc"): return True    # the tests are not run under coverage when labeled
+    src = ROOTCFG / path
+    if not src.exists(): return False
+    old_text = src.read_text(encoding="utf-8"); new_text = apply(old_text, hunks)
+    try:
+        if path.endswith(".toml"):
+            import tomllib
+            o, n = tomllib.loads(old_text), tomllib.loads(new_text)
+            return o.get("tool", {}).get("pytest") == n.get("tool", {}).get("pytest") and "pytest" not in n
+        import configparser
+        def sec(t):
+            c = configparser.RawConfigParser(strict=False); c.read_string(t)
+            return {k: dict(c[k]) for k in c.sections() if "pytest" in k}
+        return sec(old_text) == sec(new_text) == {}
+    except Exception:
+        return False
 
 def log(*a): print(*a, file=sys.stderr)
 
@@ -21,9 +122,21 @@ def parse_patch(text):
     files, cur, hunk = [], None, None
     for line in text.split("\n"):
         if line.startswith("diff --git "):
-            cur = {"old": None, "new": None, "hunks": []}; files.append(cur); hunk = None
+            cur = {"old": None, "new": None, "hunks": [], "hdr": {}}; files.append(cur); hunk = None
+            m = re.match(r"diff --git a/(\S+) b/(\S+)$", line)
+            if m: cur["hdr"]["a"], cur["hdr"]["b"] = m.group(1), m.group(2)
         elif cur is None:
             continue
+        elif hunk is None and line.startswith(("rename from ", "copy from ")):
+            cur["hdr"]["rename_from"] = line.split(" ", 2)[2].strip()
+        elif hunk is None and line.startswith(("rename to ", "copy to ")):
+            cur["hdr"]["rename_to"] = line.split(" ", 2)[2].strip()
+        elif hunk is None and line.startswith("new file mode"):
+            cur["hdr"]["new_file"] = True
+        elif hunk is None and line.startswith("deleted file mode"):
+            cur["hdr"]["deleted"] = True
+        elif hunk is None and line.startswith("Binary files "):
+            cur["hdr"]["binary"] = True
         elif hunk is None and line.startswith("--- "):
             cur["old"] = None if line[4:].strip() == "/dev/null" else line[4:].strip()[2:]
         elif hunk is None and line.startswith("+++ "):
@@ -40,8 +153,13 @@ def parse_patch(text):
         else:
             hunk = None  # a git header line (rename, mode, index) between files
     for f in files:
-        if f["old"] is None and f["new"] is None:  # rename/mode-only: take names from header
-            pass
+        h = f["hdr"]
+        if f["old"] is None and f["new"] is None and not f["hunks"]:   # no ---/+++ lines: rename, mode, binary
+            if "rename_from" in h or "rename_to" in h:
+                f["old"], f["new"] = h.get("rename_from"), h.get("rename_to")
+            elif "a" in h:
+                f["old"] = None if h.get("new_file") else h["a"]
+                f["new"] = None if h.get("deleted") else h["b"]
     return files
 
 def apply(old_text, hunks):
@@ -225,10 +343,13 @@ class Selector:
                                 out[(qq, x.targets[0].id)] = x
                         walk(st.body, qq)
             walk(tree.body, ""); return out
-        def stripped(tree):
-            t = copy.deepcopy(tree)
-            for x in entries(t).values(): x.value.values = [ast.Constant(None) for _ in x.value.values]
-            return ast.dump(t)
+        def stripped(tree):   # ast.dump with every class-body dict's values blanked (in place, then restored)
+            saved = [(x, x.value.values) for x in entries(tree).values()]
+            try:
+                for x, v in saved: x.value.values = [ast.Constant(None) for _ in v]
+                return ast.dump(tree)
+            finally:
+                for x, v in saved: x.value.values = v
         old_e, new_e = entries(old_tree), entries(new_tree)
         if not old_e or stripped(old_tree) != stripped(new_tree): return None
         D, groups, gof = self.m["dicts"], self.m["dict_groups"], self.m["dict_group_of"]
@@ -407,7 +528,11 @@ class Selector:
                     if cr is not None: return cr
                 return mod_users, "module-level"
             if any(ln in import_lines for ln in range(s, e + 1)):
-                return self.ALL, "runs at import"   # e.g. metaclasses, factories called in class bodies
+                # e.g. metaclasses, factories called in class bodies, SQL parsed into module constants:
+                # if everything the patched package builds at import is identical, only test-time runs matter
+                if not (AGGRESSIVE and self.import_state_same()):
+                    return self.ALL, "runs at import"
+                why.append(f"{path}:{s} runs at import, import-time state unchanged")
             ts = set()
             for ln in range(s, e + 1):
                 if str(ln) in lines: ts |= set(self.sets[lines[str(ln)]])
@@ -437,19 +562,203 @@ class Selector:
         why.append(f"{path}: {len(picked)} tests")
         return picked | readers
 
+    def import_state_same(self):
+        """statedigest.py on the patched package equals the pinned digest (cached per patch)."""
+        if self._state_same is None:
+            self._state_same = False
+            try:
+                if STATE_PINNED.exists() and PINNED_DIR.exists():
+                    changed = {f["new"]: apply(self.files[f["new"]]["text"], f["hunks"]) for f in self._cur_files
+                               if f["new"] and f["old"] == f["new"] and f["new"] in self.files}
+                    self._state_same = state_digest(changed) == STATE_PINNED.read_text().strip()
+            except Exception as e:
+                log("  import-state check failed:", repr(e)[:150])
+        return self._state_same
+
     def select(self, patch_text):
         why, picked = [], set()
+        self.protect = set(); self._state_same = None; self._cur_files = parse_patch(patch_text)   # tests chosen by rules that know them exactly: never dropped by the giant areas
         for f in parse_patch(patch_text):
             path = f["new"] or f["old"]
+            if f["old"] and f["new"] and f["old"] != f["new"]:     # rename/copy: the old path goes, the new one comes
+                gone = dict(f, new=None); come = dict(f, old=None)
+                parts = [self.other_file(gone, why), self.other_file(come, why)]
+                if any(x is None for x in parts):
+                    why.append(f"{f['old']} -> {f['new']}: rename -> all"); return self.ALL, why
+                picked |= parts[0] | parts[1]; continue
             if f["old"] in self.files and f["new"] == f["old"] and path.endswith(".py"):
                 picked |= self.py_source(path, f["hunks"], why)
-            elif f["old"] == f["new"] and path in self.reads:
+                continue
+            if f["old"] == f["new"] and path.startswith("tests/") and path.endswith(".py") and path in self.test_files:
+                ts = self.test_source(path, f["hunks"], why)
+                if ts is not None:
+                    picked |= ts; self.protect |= ts; continue
+            if f["old"] == f["new"] and path in TPC_FIXTURES and path in self.reads:
+                ts = self.tpc_fixture(path, f["hunks"], why)
+                picked |= ts; self.protect |= ts
+            elif f["old"] == f["new"] and path in self.reads and path not in CONFIG_FILES:
                 picked |= set(self.sets[self.reads[path]]); why.append(f"{path}: fixture readers")
             elif f["old"] == f["new"] and path in self.test_files:
                 picked |= set(self.sets[self.test_files[path]]); why.append(f"{path}: test file")
             else:
-                why.append(f"{path}: unknown kind of change -> all"); return self.ALL, why
+                ts = self.other_file(f, why)
+                if ts is None:
+                    why.append(f"{path}: unknown kind of change -> all"); return self.ALL, why
+                picked |= ts; self.protect |= ts
         return picked, why
+
+    # ----- the TPC-H / TPC-DS query fixtures -----
+    def tpc_fixture(self, path, hunks, why):
+        """TestExecutor.setUpClass loads both files with tests/helpers.load_sql_fixture_pairs (so every
+        TestExecutor test reads them), but only uses (meta, sql) of tpc-ds in test_execute_tpcds, and of
+        tpc-h in test_execute_tpch, plus (sql, optimized) of tpc-h in test_optimized_tpch. Readers in
+        other classes (test_optimizer's check_file) are kept. If the patched file loads into the same
+        number of pairs, the other TestExecutor tests cannot change."""
+        readers = set(self.sets[self.reads[path]]); id_of = self._ids()
+        src = PINNED_DIR / path
+        try:
+            old_text = src.read_text(encoding="utf-8"); new_text = apply(old_text, hunks)
+            po, pn = list(fixture_pairs(old_text)), list(fixture_pairs(new_text))
+        except Exception as e:
+            why.append(f"{path}: fixture loader fails ({type(e).__name__}) -> {len(readers)} readers"); return readers
+        if len(po) != len(pn):
+            why.append(f"{path}: pairs {len(po)} -> {len(pn)} -> {len(readers)} readers"); return readers
+        ds = "tpc-ds" in path
+        # mp_execute reads meta only as `if not meta.get("execute")`
+        ms_changed = [i for i, (a, b) in enumerate(zip(po, pn))
+                      if (bool(a[0].get("execute")), a[1]) != (bool(b[0].get("execute")), b[1])]
+        sq_changed = [i for i, (a, b) in enumerate(zip(po, pn)) if a[1:] != b[1:]]
+        keep = set()
+        for n in readers:
+            tid = id_of.get(n, "")
+            if not tid.startswith("tests/test_executor.py::TestExecutor::"): keep.add(n); continue
+            name = tid.rsplit("::", 1)[-1]
+            if ds and name == "test_execute_tpcds" and ms_changed:
+                # a changed query that is not executed matters only if parse_one fails on it; an executed
+                # one only if the executor rows or the DuckDB frame of its new SQL differ from the pinned
+                if any(po[i][0].get("execute") or pn[i][0].get("execute") for i in ms_changed):
+                    if not tpcds_fixture_same(po, pn, ms_changed, why): keep.add(n)
+                elif not parses([pn[i][1] for i in ms_changed]):
+                    keep.add(n)
+            elif not ds and name == "test_execute_tpch" and ms_changed: keep.add(n)
+            elif not ds and name == "test_optimized_tpch" and sq_changed: keep.add(n)
+        why.append(f"{path}: {len(ms_changed)} (meta, sql) pairs changed -> {len(keep)} of {len(readers)} readers")
+        return keep
+
+    # ----- test code (tests/**/*.py): per-test line coverage of the test files (testmap.json.gz) -----
+    def _tm(self):
+        if not hasattr(self, "tm"):
+            self.tm = json.loads(gzip.decompress(TESTMAP.read_bytes())) if TESTMAP.exists() else None
+        return self.tm
+
+    def test_source(self, path, hunks, why):
+        """An edit of an existing test module. Functions whose code changed select the tests that ran any
+        line of their body (that test's own body, helpers it called, setUpClass for its class). Changes
+        outside function bodies, or to code run at collection, select the module's tests and the tests of
+        modules that import it. None: not handled here (caller falls back)."""
+        tm = self._tm(); src = PINNED_DIR / path
+        if tm is None or not src.exists(): return None
+        old_text = src.read_text(encoding="utf-8")
+        module = set(self.sets[self.test_files[path]])
+        try:
+            old_tree = ast.parse(old_text); new_tree = ast.parse(apply(old_text, hunks))
+        except SyntaxError:
+            why.append(f"{path}: syntax error -> {len(module)} tests of the module and its importers"); return module
+        if ast.dump(old_tree) == ast.dump(new_tree):
+            why.append(f"{path}: same AST -> 0"); return set()
+        def collect(tree):
+            funcs = {}
+            def skel(body, prefix):
+                out = []
+                for st in body:
+                    if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        funcs[prefix + st.name] = st; out.append(("F", prefix + st.name))
+                    elif isinstance(st, ast.ClassDef):
+                        out.append(("C", prefix + st.name, ast.dump(ast.Tuple(st.bases, ast.Load())),
+                                    str([ast.dump(k) for k in st.keywords]), str([ast.dump(d) for d in st.decorator_list]),
+                                    skel(st.body, prefix + st.name + ".")))
+                    else:
+                        out.append(("S", ast.dump(st)))
+                return out
+            return skel(tree.body, ""), funcs
+        so, fo = collect(old_tree); sn, fn = collect(new_tree)
+        # new functions that cannot change what existing code does: new test methods, and new module-level
+        # functions whose name the module did not define before (and that no hook mechanism looks up)
+        old_names = {n.id for n in ast.walk(old_tree) if isinstance(n, ast.Name)} | {q.split(".")[0] for q in fo} | \
+            {a.asname or a.name.split(".")[0] for n in ast.walk(old_tree) if isinstance(n, (ast.Import, ast.ImportFrom)) for a in n.names}
+        def harmless_new(q):
+            name = q.rsplit(".", 1)[-1]
+            if "." in q: return name.startswith("test")
+            return name not in old_names and not name.startswith(("pytest_", "setup", "teardown", "setUp", "tearDown", "load_tests", "_"))
+        added_tests = {q for q in fn if q not in fo and harmless_new(q)}
+        removed = {q for q in fo if q not in fn}
+        if any("." not in q for q in removed):   # another module may import it by name
+            why.append(f"{path}: module-level function removed -> {len(module)}"); return module
+        def drop(sk, names):
+            out = []
+            for e in sk:
+                if e[0] == "F" and e[1] in names: continue
+                out.append(e[:5] + (drop(e[5], names),) if e[0] == "C" else e)
+            return out
+        if drop(so, removed) != drop(sn, added_tests):
+            why.append(f"{path}: module/class-level change -> {len(module)}"); return module
+        info = tm["files"].get(path, {"lines": {}, "import_lines": [], "unknown_lines": []})
+        at_import = set(info["import_lines"]) | set(info["unknown_lines"])
+        id_of = self._ids()
+        picked = set()
+        for q in sorted(removed | {q for q in fo if q in fn and ast.dump(fo[q]) != ast.dump(fn[q])}):
+            node = fo[q]; name = q.rsplit(".", 1)[-1]
+            body = range(node.body[0].lineno, node.end_lineno + 1)
+            if any(ln in at_import for ln in body):
+                why.append(f"{path}: {q} runs at collection -> {len(module)}"); return module
+            ts = set()
+            for ln in body:
+                k = info["lines"].get(str(ln))
+                if k is not None: ts |= set(tm["sets"][k])
+            header_changed = q in removed or ast.dump(ast.Module(fo[q].decorator_list + [fo[q].args], [])) != \
+                ast.dump(ast.Module(fn[q].decorator_list + [fn[q].args], []))
+            if q in removed or header_changed or name.startswith("test"):
+                ts |= {n for n in module if id_of.get(n, "").endswith("::" + name)}
+            picked |= ts
+            why.append(f"{path}: {q} -> {len(ts)} tests that ran it")
+        return picked
+
+    def _ids(self):
+        if not hasattr(self, "id_of"):
+            try:
+                self.id_of = {t["number"]: t["id"] for t in json.loads((DATA / "tests.json").read_text())["tests"]}
+            except Exception:
+                self.id_of = {}
+        return self.id_of
+
+    # ----- files outside the Python sources -----
+    def other_file(self, f, why):
+        """New, deleted, or edited files that are not sqlglot sources or test modules. None: select all."""
+        old, new = f["old"], f["new"]; path = new or old
+        if not path: return None
+        name = path.rsplit("/", 1)[-1]
+        if name in RISKY_NAMES or path.endswith(".pth"): return None
+        if path in CONFIG_FILES and old == new:
+            if config_unchanged_for_pytest(path, f["hunks"]):
+                why.append(f"{path}: config edit, pytest settings unchanged -> 0"); return set()
+            return None
+        if old is None:                                   # a new file
+            if path in CONFIG_FILES or path.endswith("__init__.py"): return None
+            if path.startswith("sqlglot/") and path.endswith(".py"):
+                d = path.rsplit("/", 1)[0] + "/"   # modules are imported by name; only tests that list a
+                ts = set()                          # package directory (they read its files) can see it
+                for r, k in self.reads.items():
+                    if r.startswith(d) and "/" not in r[len(d):]: ts |= set(self.sets[k])
+                why.append(f"{path}: new module -> {len(ts)} readers of its directory"); return ts
+            why.append(f"{path}: new file, nothing lists its directory -> 0"); return set()
+        if new is None:                                   # a deleted file
+            if path in self.files or (path.startswith("tests/") and path.endswith(".py")): return None
+            ts = set(self.sets[self.reads[path]]) if path in self.reads else set()
+            why.append(f"{path}: deleted -> {len(ts)} readers"); return ts
+        if path in self.reads:
+            ts = set(self.sets[self.reads[path]]); why.append(f"{path}: readers {len(ts)}"); return ts
+        if path.endswith(".py") and (path.startswith("sqlglot/") or path.startswith("tests/")): return None
+        why.append(f"{path}: no test reads or imports it -> 0"); return set()
 
 # ---------- aggressive mode (opt-in, accepts miss risk for speed) ----------
 # Keep a giant test only when the edit is in code that test specifically checks; replace
@@ -503,13 +812,11 @@ def run_script(script, root, timeout=8):   # normal run ~1 s; a hang must not bu
 def patched_tree(sel, files):
     import shutil, tempfile
     root = Path(tempfile.mkdtemp(prefix="brfp", dir="/tmp"))
-    if PINNED_DIR.exists(): shutil.copytree(PINNED_DIR, root, dirs_exist_ok=True)
-    else: write_tree(sel, root)
-    for f in files:
-        p = root / f["new"]
-        p.write_text(apply(sel.files[f["new"]]["text"], f["hunks"]), encoding="utf-8")
-        pyc = p.parent / "__pycache__"
-        for c in (pyc.glob(p.stem + ".*.pyc") if pyc.exists() else []): c.unlink()
+    changed = {f["new"]: apply(sel.files[f["new"]]["text"], f["hunks"]) for f in files}
+    if PINNED_DIR.exists(): link_tree(PINNED_DIR, root, changed)   # symlinks: no copy of the pinned tree
+    else:
+        write_tree(sel, root)
+        for rel, txt in changed.items(): (root / rel).write_text(txt, encoding="utf-8")
     return root
 
 def body_only(sel, files):
@@ -560,9 +867,19 @@ def build_pinned(sel):
         # runnable tests for the runner (normally shipped prebuilt: running the suite twice is slow)
         import runner
         runner.build(str(APP / "tests.json")); log("runner: runnable tests", len(json.loads(RUNNABLE_PATH.read_text())))
+    sa, sb = state_digest({}, 60), state_digest({}, 60)
+    if sa and sa == sb: STATE_PINNED.write_text(sa); log("pinned import-state digest:", sa)
+    else: log("import-state digest not reproducible: check off", sa, sb)
     a, b = run_script("maxnodes_fp.py", PINNED_DIR, 300), run_script("maxnodes_fp.py", PINNED_DIR, 300)
     if a != b: log("pinned max_nodes results are not deterministic: check off"); return
     MAXNODES_PINNED.write_text(json.dumps(a)); log("pinned max_nodes results:", len(a))
+
+TPCDS_CPU_MAX, TPCDS_CPU_SHARE = 12.0, 0.6   # v23: CPU cap of one TPC-DS check (seconds; share of its worth)
+
+def _cpu_limit(sec):
+    import resource
+    n = max(1, int(sec))
+    resource.setrlimit(resource.RLIMIT_CPU, (n, n + 1))   # SIGXCPU at n s of CPU, SIGKILL at n + 1
 
 _PERQ = None
 def tpcds_checkable(sel, files):
@@ -607,26 +924,25 @@ def tpcds_checkable(sel, files):
             chosen.add(max(qs, key=lambda q: sum(1 for o in force_lines if q in o)))
     return chosen
 
-def tpcds_unaffected(sel, text):
+def tpcds_unaffected(sel, text, worth=21.0):
+    """worth: seconds of score that dropping the test saves. The check's child process gets a hard CPU
+    limit below that (RLIMIT_CPU), so a check that cannot finish never costs more than it could win."""
     if not (sel.tpcds and PINNED_FP.exists() and TPCDS_RESULTS.exists()): return False
+    cpu_cap = min(TPCDS_CPU_MAX, TPCDS_CPU_SHARE * worth)
+    if cpu_cap < 3: return False
     files = parse_patch(text)
     force = tpcds_checkable(sel, files)
     if force is None: return False
-    import shutil, tempfile
-    root = Path(tempfile.mkdtemp(prefix="brfp", dir="/tmp"))
+    import shutil
+    root = patched_tree(sel, files)
     try:
-        if PINNED_DIR.exists(): shutil.copytree(PINNED_DIR, root, dirs_exist_ok=True)
-        for f in files:
-            p = root / f["new"]
-            p.write_text(apply(sel.files[f["new"]]["text"], f["hunks"]), encoding="utf-8")
-            pyc = p.parent / "__pycache__"
-            for c in (pyc.glob(p.stem + ".*.pyc") if pyc.exists() else []): c.unlink()
         import subprocess
         r = subprocess.run([sys.executable, "-I", str(APP / "tpcds_res.py"), str(root), str(SPEC), str(PINNED_FP),
                             str(TPCDS_RESULTS), str(TPCDS_DATA)] + (["--force", ",".join(map(str, sorted(force)))] if force else []),
-                           capture_output=True, text=True, timeout=20,
+                           capture_output=True, text=True, timeout=2 * cpu_cap + 5,
+                           preexec_fn=lambda: _cpu_limit(cpu_cap),
                            env={"PYTHONDONTWRITEBYTECODE": "1", "PATH": os.environ.get("PATH", "")})
-        res = json.loads(r.stdout) if r.returncode == 0 else {"ok": False, "why": r.stderr[-200:]}
+        res = json.loads(r.stdout) if r.returncode == 0 else {"ok": False, "why": f"rc {r.returncode} " + r.stderr[-200:]}
         log("  TPC-DS result check:", res)
         return res.get("ok") is True
     finally:
@@ -659,7 +975,8 @@ def aggressive(sel, picked, paths, num_of, text=None):
     n = num_of.get(TPCDS_ID)
     if n in picked and text is not None and TPCDS_CHECK:
         try:
-            if tpcds_unaffected(sel, text): picked = picked - {n}; log("  TPC-DS stage fingerprints unchanged: dropped")
+            worth = commit_cost(picked, MS_ALL) - commit_cost(picked - {n}, MS_ALL) if MS_ALL else 21.0
+            if tpcds_unaffected(sel, text, worth): picked = picked - {n}; log("  TPC-DS stage fingerprints unchanged: dropped")
             else: log("  TPC-DS kept (not checkable, or fingerprints changed)")
         except Exception as e:
             log("  TPC-DS fingerprint check failed, keeping it:", repr(e)[:200])
@@ -667,8 +984,12 @@ def aggressive(sel, picked, paths, num_of, text=None):
 
 # ---------- splitting over workers ----------
 # ---------- in-container runner (fast mode) ----------
-RUNNER = True
+RUNNER = os.environ.get("BR_RUNNER", "1") == "1"   # v26: on, gated to small code-only selections (BR_RUNNER=0 turns it off)
+RUN_SHARE, RUN_BUDGET = 0.45, 12.0     # run when est. CPU < 45% of the selection's cost; <= 12 s per batch
+HEAVY_SETUP = ("tests/test_optimizer.py", "tests/test_executor.py")   # costly setUpClass (duckdb, data)
+_RUN_CPU = [0.0]
 PROBE = None   # diagnostic builds only
+MS_ALL = {}    # test number -> recorded ms (set in main)
 RUNNABLE_PATH = APP / "runner_pinned.json"
 _runnable = None
 NEVER_RUN = {"tests/test_generator.py::TestGenerator::test_generator_memory"}   # order/memory sensitive
@@ -685,10 +1006,15 @@ def run_or_select(sel, text, nums, ms, id_of, why):
         _runnable = set(json.loads(RUNNABLE_PATH.read_text())) if RUNNABLE_PATH.exists() else set()
     ids = [id_of[n] for n in nums]
     if not _runnable or any(i not in _runnable or i in NEVER_RUN for i in ids): return nums
+    # v24: only edits of existing sqlglot modules (fixture and test edits nearly always break their tests,
+    # so running them only adds CPU), small selections, and within a CPU budget for the whole batch
+    if not all(f["old"] == f["new"] and f["new"] and f["new"].startswith("sqlglot/") and f["new"].endswith(".py")
+               and f["new"] in sel.files for f in parse_patch(text)): return nums
     load = sum(ms[n] for n in nums) / 1000
-    est = 0.25 + 1.3 * load                     # warm child: fresh sqlglot import + the tests
+    heavy = any(i.startswith(HEAVY_SETUP) for i in ids)
+    est = 0.2 + 1.5 * load + (0.8 if heavy else 0.0)
     saved_if_clean = commit_cost(nums, ms)
-    if est >= 0.8 * saved_if_clean: return nums   # a breaking commit pays the CPU and saves little
+    if est >= RUN_SHARE * saved_if_clean or _RUN_CPU[0] + est > RUN_BUDGET: return nums
     files = {}
     for f in parse_patch(text):
         rel = f["new"]
@@ -702,17 +1028,15 @@ def run_or_select(sel, text, nums, ms, id_of, why):
             return nums
         files[rel] = apply(base, f["hunks"])
     import runner, shutil, tempfile
-    runner.warm()
+    if heavy: runner.warm()          # numpy/pandas/duckdb only for the modules that use them
     root = Path(tempfile.mkdtemp(prefix="brrun", dir="/tmp"))
     try:
-        shutil.copytree(PINNED_DIR, root, dirs_exist_ok=True)     # patched tree on disk: sources, fixtures,
-        for rel, src in files.items():                             # subprocesses all see the patched code
-            (root / rel).write_text(src, encoding="utf-8")
-            pyc = (root / rel).parent / "__pycache__"
-            for c in (pyc.glob((root / rel).stem + ".*.pyc") if pyc.exists() else []): c.unlink()
+        link_tree(PINNED_DIR, root, files)     # patched tree on disk: sources, fixtures, subprocesses all
+                                               # see the patched code; unpatched entries are symlinks
         failed = runner.run({}, ids, timeout=max(5, 4 * est), root=str(root))
     finally:
         shutil.rmtree(root, ignore_errors=True)
+    _RUN_CPU[0] += runner.LAST_CPU
     if failed is None:
         why.append("runner: error or timeout, selection kept"); return nums
     num_of_id = {id_of[n]: n for n in nums}
@@ -720,6 +1044,31 @@ def run_or_select(sel, text, nums, ms, id_of, why):
     if len(out) != len(failed): return nums                                     # unexpected ids: be safe
     why.append(f"runner: ran {len(nums)} tests ({load:.2f} s recorded, est {est:.2f} s, cpu {runner.LAST_CPU:.2f} s, saved-if-clean {saved_if_clean:.2f} s), {len(out)} failed")
     return out
+
+def link_tree(src, dst, files):
+    """dst mirrors src: real directories only along the paths of the patched files (written as real
+    files, their stale bytecode left out); every other entry is a symlink into src."""
+    need = {}
+    for rel in files:
+        parts = rel.split("/")
+        for i in range(len(parts) - 1): need.setdefault("/".join(parts[:i + 1]), set())
+    def fill(rel_dir):
+        s = src / rel_dir if rel_dir else src; d = dst / rel_dir if rel_dir else dst
+        d.mkdir(parents=True, exist_ok=True)
+        for e in os.scandir(s):
+            r = f"{rel_dir}/{e.name}" if rel_dir else e.name
+            if r in need: fill(r)
+            elif r in files: (d / e.name).write_text(files[r], encoding="utf-8")
+            elif e.name == "__pycache__" and any(f.rsplit("/", 1)[0] == rel_dir for f in files):
+                pd = d / "__pycache__"; pd.mkdir()
+                stems = {f.rsplit("/", 1)[-1][:-3] for f in files if f.rsplit("/", 1)[0] == rel_dir}
+                for c in os.scandir(e.path):
+                    if c.name.split(".")[0] not in stems: os.symlink(c.path, pd / c.name)
+            else: os.symlink(e.path, d / e.name)
+        for r, txt in files.items():   # new files in this directory
+            if r.rsplit("/", 1)[0] == rel_dir and "/" in r and not (d / r.rsplit("/", 1)[-1]).exists():
+                (d / r.rsplit("/", 1)[-1]).write_text(txt, encoding="utf-8")
+    fill("")
 
 def split(nums, ms):
     """Try 1..8 workers, longest test first onto the lightest worker; keep the cheapest."""
@@ -738,6 +1087,7 @@ def main():
         build_pinned(Selector()); return
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
+    MS_ALL.update(ms)
     sel = Selector()
     num_of = {t["id"]: t["number"] for t in tests}
     id_of = {t["number"]: t["id"] for t in tests}
@@ -747,7 +1097,7 @@ def main():
             nums, why = sel.select(text)
             if AGGRESSIVE:
                 paths = [f["new"] or f["old"] for f in parse_patch(text)]
-                if all(paths): nums = aggressive(sel, set(nums), paths, num_of, text)
+                if all(paths): nums = aggressive(sel, set(nums), paths, num_of, text) | (set(nums) & sel.protect)
         except Exception as e:  # never crash: a crash rejects the run, a wide answer only costs time
             nums, why = sel.ALL, [f"error {e!r} -> all"]
         nums = {n for n in nums if n in ms}

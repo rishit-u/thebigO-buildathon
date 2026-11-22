@@ -5,7 +5,8 @@ FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf107
 # Short timeouts so a build without network moves on quickly; then the stub runner list is kept.
 RUN pip install --no-cache-dir --timeout 15 --retries 1 duckdb==2.0.0 numpy==2.5.5 pandas==3.1.1 \
         python-dateutil pytz tzdata six || echo "test dependencies not installed"
-COPY selector.py map.json.gz tpcds_fp.py tpcds_res.py maxnodes_fp.py /app/
+COPY selector.py map.json.gz testmap.json.gz tpcds_fp.py tpcds_res.py maxnodes_fp.py statedigest.py /app/
+COPY rootcfg /app/rootcfg
 COPY tpcds_data /app/tpcds_data
 # in-container runner: the pinned test suite and the test list (to find the tests runnable here)
 COPY runner.py tests.json runner_pinned.json runner_pinned_deps.json tpcds_perq.json /app/

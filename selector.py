@@ -685,9 +685,9 @@ def run_or_select(sel, text, nums, ms, id_of, why):
     ids = [id_of[n] for n in nums]
     if not _runnable or any(i not in _runnable or i in NEVER_RUN for i in ids): return nums
     load = sum(ms[n] for n in nums) / 1000
-    est = 0.3 + 1.6 * load                      # child CPU: fresh import + the tests (measured ~1.0-1.6x)
+    est = 0.25 + 1.3 * load                     # warm child: fresh sqlglot import + the tests
     saved_if_clean = commit_cost(nums, ms)
-    if est >= saved_if_clean: return nums
+    if est >= 0.8 * saved_if_clean: return nums   # a breaking commit pays the CPU and saves little
     files = {}
     for f in parse_patch(text):
         rel = f["new"]
@@ -700,14 +700,24 @@ def run_or_select(sel, text, nums, ms, id_of, why):
         else:
             return nums
         files[rel] = apply(base, f["hunks"])
-    import runner
-    failed = runner.run(files, ids, timeout=max(5, 4 * est))
+    import runner, shutil, tempfile
+    runner.warm()
+    root = Path(tempfile.mkdtemp(prefix="brrun", dir="/tmp"))
+    try:
+        shutil.copytree(PINNED_DIR, root, dirs_exist_ok=True)     # patched tree on disk: sources, fixtures,
+        for rel, src in files.items():                             # subprocesses all see the patched code
+            (root / rel).write_text(src, encoding="utf-8")
+            pyc = (root / rel).parent / "__pycache__"
+            for c in (pyc.glob((root / rel).stem + ".*.pyc") if pyc.exists() else []): c.unlink()
+        failed = runner.run({}, ids, timeout=max(5, 4 * est), root=str(root))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
     if failed is None:
         why.append("runner: error or timeout, selection kept"); return nums
     num_of_id = {id_of[n]: n for n in nums}
     out = {num_of_id[i] for i in failed if i in num_of_id}
     if len(out) != len(failed): return nums                                     # unexpected ids: be safe
-    why.append(f"runner: ran {len(nums)} tests ({load:.2f} s recorded), {len(out)} failed")
+    why.append(f"runner: ran {len(nums)} tests ({load:.2f} s recorded, est {est:.2f} s, cpu {runner.LAST_CPU:.2f} s, saved-if-clean {saved_if_clean:.2f} s), {len(out)} failed")
     return out
 
 def split(nums, ms):

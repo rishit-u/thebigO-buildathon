@@ -12,8 +12,13 @@ fail or are unstable on the pinned tree in this environment are never run (see -
 import importlib.abc, importlib.util, json, os, pickle, sys, time, unittest
 
 APP = os.path.dirname(os.path.abspath(__file__))
+LAST_CPU = 0.0
 ROOT = os.path.join(APP, "pinned")
 HEAVY = ("duckdb", "pandas", "numpy", "pytest")
+
+
+import importlib.machinery as _mach
+_AVAILABLE = {m for m in HEAVY if _mach.PathFinder.find_spec(m) is not None}
 
 
 class _Missing:
@@ -39,7 +44,9 @@ class Overlay(importlib.abc.MetaPathFinder, importlib.abc.Loader):
             if name.endswith(".__init__"): name = name[: -len(".__init__")]
             self.mods[name] = (rel, src)
     def find_spec(self, name, path, target=None):
-        if name.split(".")[0] in HEAVY:   # stand-in: importable, unusable (tests using it fail on pinned and are never run)
+        if name.split(".")[0] in HEAVY and name.split(".")[0] not in _AVAILABLE:
+            # not installed in this image: a stand-in that is importable but unusable (tests that use
+            # it fail on the pinned tree too, so they are never run here)
             return importlib.util.spec_from_loader(name, _Stub(), is_package=True)
         if name in self.mods:
             rel, _ = self.mods[name]
@@ -65,23 +72,57 @@ class Result(unittest.TestResult):
         if err is not None: self.failed.add(getattr(test, "_bb_id", str(test)))
 
 
-def _child(files, test_ids):
+class Inline:
+    """In-process stand-in for ProcessPoolExecutor, with the pickle round trip a real pool does."""
+    def __init__(self, *a, initializer=None, initargs=(), **k):
+        if initializer: initializer(*pickle.loads(pickle.dumps(initargs)))
+    def submit(self, fn, *args, **kwargs):
+        from concurrent.futures import Future
+        f = Future()
+        try: f.set_result(pickle.loads(pickle.dumps(fn(*pickle.loads(pickle.dumps(args)), **kwargs))))
+        except BaseException as e: f.set_exception(e)
+        return f
+    def map(self, fn, *its, **k): return map(fn, *its)
+    def shutdown(self, *a, **k): pass
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+
+def _child(files, test_ids, root=None):
+    """root: a full patched tree on disk (sqlglot/ and tests/), so that tests reading sources or
+    fixtures from disk, and subprocesses, see the patched code; otherwise files are overlaid in memory."""
+    global ROOT
     os.environ["SKIP_INTEGRATION"] = "0"
+    if root: ROOT = root
     os.chdir(ROOT)                                   # tests open fixtures by relative path
     sys.path.insert(0, ROOT)
-    sys.meta_path.insert(0, Overlay(files))
+    sys.meta_path.insert(0, Overlay({} if root else files))
     import unittest as _u                            # noqa: F401  (UNITTEST flag, as under the real suite)
     suite = unittest.TestSuite()
     for tid in test_ids:
         path, cls, meth = tid.split("::")
         mod = importlib.import_module(path[:-3].replace("/", "."))
+        if hasattr(mod, "ProcessPoolExecutor"): mod.ProcessPoolExecutor = Inline   # run pooled work in-process
         case = getattr(mod, cls)(meth); case._bb_id = tid
         suite.addTest(case)
     res = Result(); suite.run(res)
     return sorted(res.failed)
 
 
-def run(files, test_ids, timeout):
+_WARM = False
+def warm():
+    """Import the heavy third-party test dependencies once in the parent: every forked child shares
+    them, so a child only pays for importing the (patched) sqlglot and the test modules."""
+    global _WARM
+    if _WARM: return
+    _WARM = True
+    for m in ("numpy", "pandas", "pandas.testing", "duckdb"):
+        if m.split(".")[0] in _AVAILABLE:
+            try: importlib.import_module(m)
+            except Exception: pass
+
+
+def run(files, test_ids, timeout, root=None):
     """Fork a child; return the list of failing test ids, or None on error/timeout."""
     import signal
     r, w = os.pipe()
@@ -90,7 +131,7 @@ def run(files, test_ids, timeout):
         os.close(r)
         try:
             signal.alarm(max(1, int(timeout)))
-            out = {"failed": _child(files, test_ids)}
+            out = {"failed": _child(files, test_ids, root)}
         except BaseException as e:
             out = {"error": repr(e)[:300]}
         try: os.write(w, json.dumps(out).encode())
@@ -102,7 +143,9 @@ def run(files, test_ids, timeout):
         if not chunk: break
         data += chunk
     os.close(r)
-    os.waitpid(pid, 0)
+    _, _, usage = os.wait4(pid, 0)
+    global LAST_CPU
+    LAST_CPU = usage.ru_utime + usage.ru_stime
     try: out = json.loads(data or b"{}")
     except ValueError: return None
     return out.get("failed") if "failed" in out else None

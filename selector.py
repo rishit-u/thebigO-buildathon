@@ -914,7 +914,7 @@ def aggressive(sel, picked, paths, num_of, text=None):
 
 # ---------- splitting over workers ----------
 # ---------- in-container runner (fast mode) ----------
-RUNNER = os.environ.get("BR_RUNNER", "0") == "1"   # off by default: on practice it saved one 2 s worker fee for about 2 s CPU (v17)
+RUNNER = os.environ.get("BR_RUNNER", "1") == "1"   # v26: on, gated to small code-only selections (BR_RUNNER=0 turns it off)
 RUN_SHARE, RUN_BUDGET = 0.45, 12.0     # run when est. CPU < 45% of the selection's cost; <= 12 s per batch
 HEAVY_SETUP = ("tests/test_optimizer.py", "tests/test_executor.py")   # costly setUpClass (duckdb, data)
 _RUN_CPU = [0.0]
@@ -958,7 +958,7 @@ def run_or_select(sel, text, nums, ms, id_of, why):
             return nums
         files[rel] = apply(base, f["hunks"])
     import runner, shutil, tempfile
-    runner.warm()
+    if heavy: runner.warm()          # numpy/pandas/duckdb only for the modules that use them
     root = Path(tempfile.mkdtemp(prefix="brrun", dir="/tmp"))
     try:
         link_tree(PINNED_DIR, root, files)     # patched tree on disk: sources, fixtures, subprocesses all

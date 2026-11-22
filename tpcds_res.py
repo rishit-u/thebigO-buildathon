@@ -17,6 +17,7 @@ def main():
     root, spec = sys.argv[1], json.load(open(sys.argv[2]))
     pinned = json.load(open(sys.argv[3])); pinned_res_path = sys.argv[4]; data = sys.argv[5]
     build = "--build" in sys.argv
+    force = set(int(x) for x in sys.argv[sys.argv.index("--force") + 1].split(",")) if "--force" in sys.argv else set()
 
     sys.path.insert(0, root)
     import unittest  # noqa: F401  -- the test suite runs with UNITTEST on (expressions/core.py)
@@ -151,7 +152,7 @@ def main():
         except Exception as ex:
             json.dump({"ok": False, "why": f"query {i}: {type(ex).__name__}"}, sys.stdout); return
         smemo.clear()
-        if pinned.get(str(i)) == row: continue
+        if pinned.get(str(i)) == row and i not in force: continue
         if not execute_flag: continue                      # only parsed by the test: no error is enough
         if row[2] != pinned[str(i)][2]:
             json.dump({"ok": False, "why": f"query {i}: DuckDB SQL changed"}, sys.stdout); return

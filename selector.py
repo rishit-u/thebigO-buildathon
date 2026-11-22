@@ -474,6 +474,7 @@ TPCDS_CHECK = True    # v16: result-level TPC-DS check (tpcds_res.py)
 APP = Path(__file__).resolve().parent
 PINNED_DIR, PINNED_FP, SPEC = APP / "pinned", APP / "tpcds_pinned.json", APP / "tpcds_spec.json"
 TPCDS_RESULTS, TPCDS_DATA = APP / "tpcds_results.json", APP / "tpcds_data"
+TPCDS_PERQ = APP / "tpcds_perq.json"     # executor lines run by each TPC-DS query (pinned run)
 
 def write_tree(sel, root, changed=None):
     for rel, info in sel.files.items():
@@ -563,35 +564,54 @@ def build_pinned(sel):
     if a != b: log("pinned max_nodes results are not deterministic: check off"); return
     MAXNODES_PINNED.write_text(json.dumps(a)); log("pinned max_nodes results:", len(a))
 
+_PERQ = None
 def tpcds_checkable(sel, files):
-    """Every change is inside the body of a function that never runs outside the fingerprinted stages."""
+    """None: cannot be checked (keep TPC-DS). Otherwise the set of executed queries that must be re-run
+    beyond those whose stage hashes change: empty when every change runs only before the executor;
+    for changes inside executor-stage functions, a small set of queries that together run every
+    changed executor line (coverage-based minimization, v18)."""
+    global _PERQ
     other = sel.tpcds["other"]
+    if _PERQ is None:
+        _PERQ = json.loads(TPCDS_PERQ.read_text()) if TPCDS_PERQ.exists() else {}
+    force_lines = []
     for f in files:
         path = f["new"] or f["old"]
         if not (path and f["old"] == f["new"] and path.startswith("sqlglot/") and path.endswith(".py") and path in sel.files):
-            return False
+            return None
         old_text = sel.files[path]["text"]; old_tree = ast.parse(old_text)
         new_tree = ast.parse(apply(old_text, f["hunks"]))
-        if registry_change(path, old_tree, new_tree): return False
+        if registry_change(path, old_tree, new_tree): return None
         removed, inserted = changed_old_lines(f["hunks"])
         tops = [n for n in ast.walk(old_tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
         bad = set(other.get(path, []))
+        perq = _PERQ.get(path, {})
         for ln in removed | inserted:
             outer = None
             for fn in tops:   # outermost function whose body holds ln
                 if fn.body[0].lineno <= ln <= fn.end_lineno and (outer is None or fn.lineno < outer.lineno):
                     outer = fn
             if outer is None:                                     # module or class level: the check imports
-                if bad: return False                              # the patched package afresh, so this is
+                if bad: return None                               # the patched package afresh, so this is
                 continue                                          # covered unless the file has executor code
-            span = set(range(outer.lineno, outer.end_lineno + 1))
-            if span & bad: return False                           # runs in the executor/comparison
-    return True
+            span = set(range(outer.lineno, outer.end_lineno + 1)) & bad
+            if not span: continue
+            # executor-stage function: every one of its executor lines must be run per query (else keep)
+            for l2 in span:
+                if str(l2) not in perq: return None
+                force_lines.append(set(perq[str(l2)]))
+    if not force_lines: return set()
+    chosen = set()
+    for qs in force_lines:                                       # greedy cover: each line run at least once
+        if not (qs & chosen):
+            chosen.add(max(qs, key=lambda q: sum(1 for o in force_lines if q in o)))
+    return chosen
 
 def tpcds_unaffected(sel, text):
     if not (sel.tpcds and PINNED_FP.exists() and TPCDS_RESULTS.exists()): return False
     files = parse_patch(text)
-    if not tpcds_checkable(sel, files): return False
+    force = tpcds_checkable(sel, files)
+    if force is None: return False
     import shutil, tempfile
     root = Path(tempfile.mkdtemp(prefix="brfp", dir="/tmp"))
     try:
@@ -603,7 +623,8 @@ def tpcds_unaffected(sel, text):
             for c in (pyc.glob(p.stem + ".*.pyc") if pyc.exists() else []): c.unlink()
         import subprocess
         r = subprocess.run([sys.executable, "-I", str(APP / "tpcds_res.py"), str(root), str(SPEC), str(PINNED_FP),
-                            str(TPCDS_RESULTS), str(TPCDS_DATA)], capture_output=True, text=True, timeout=20,
+                            str(TPCDS_RESULTS), str(TPCDS_DATA)] + (["--force", ",".join(map(str, sorted(force)))] if force else []),
+                           capture_output=True, text=True, timeout=20,
                            env={"PYTHONDONTWRITEBYTECODE": "1", "PATH": os.environ.get("PATH", "")})
         res = json.loads(r.stdout) if r.returncode == 0 else {"ok": False, "why": r.stderr[-200:]}
         log("  TPC-DS result check:", res)
@@ -647,6 +668,7 @@ def aggressive(sel, picked, paths, num_of, text=None):
 # ---------- splitting over workers ----------
 # ---------- in-container runner (fast mode) ----------
 RUNNER = True
+PROBE = None   # diagnostic builds only
 RUNNABLE_PATH = APP / "runner_pinned.json"
 _runnable = None
 NEVER_RUN = {"tests/test_generator.py::TestGenerator::test_generator_memory"}   # order/memory sensitive
@@ -664,9 +686,9 @@ def run_or_select(sel, text, nums, ms, id_of, why):
     ids = [id_of[n] for n in nums]
     if not _runnable or any(i not in _runnable or i in NEVER_RUN for i in ids): return nums
     load = sum(ms[n] for n in nums) / 1000
-    est = 0.3 + 1.6 * load                      # child CPU: fresh import + the tests (measured ~1.0-1.6x)
+    est = 0.25 + 1.3 * load                     # warm child: fresh sqlglot import + the tests
     saved_if_clean = commit_cost(nums, ms)
-    if est >= saved_if_clean: return nums
+    if est >= 0.8 * saved_if_clean: return nums   # a breaking commit pays the CPU and saves little
     files = {}
     for f in parse_patch(text):
         rel = f["new"]
@@ -679,14 +701,24 @@ def run_or_select(sel, text, nums, ms, id_of, why):
         else:
             return nums
         files[rel] = apply(base, f["hunks"])
-    import runner
-    failed = runner.run(files, ids, timeout=max(5, 4 * est))
+    import runner, shutil, tempfile
+    runner.warm()
+    root = Path(tempfile.mkdtemp(prefix="brrun", dir="/tmp"))
+    try:
+        shutil.copytree(PINNED_DIR, root, dirs_exist_ok=True)     # patched tree on disk: sources, fixtures,
+        for rel, src in files.items():                             # subprocesses all see the patched code
+            (root / rel).write_text(src, encoding="utf-8")
+            pyc = (root / rel).parent / "__pycache__"
+            for c in (pyc.glob((root / rel).stem + ".*.pyc") if pyc.exists() else []): c.unlink()
+        failed = runner.run({}, ids, timeout=max(5, 4 * est), root=str(root))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
     if failed is None:
         why.append("runner: error or timeout, selection kept"); return nums
     num_of_id = {id_of[n]: n for n in nums}
     out = {num_of_id[i] for i in failed if i in num_of_id}
     if len(out) != len(failed): return nums                                     # unexpected ids: be safe
-    why.append(f"runner: ran {len(nums)} tests ({load:.2f} s recorded), {len(out)} failed")
+    why.append(f"runner: ran {len(nums)} tests ({load:.2f} s recorded, est {est:.2f} s, cpu {runner.LAST_CPU:.2f} s, saved-if-clean {saved_if_clean:.2f} s), {len(out)} failed")
     return out
 
 def split(nums, ms):
@@ -724,6 +756,8 @@ def main():
                 nums = run_or_select(sel, text, nums, ms, id_of, why)
             except Exception as e:
                 why.append(f"runner error {e!r}: selection kept")
+        if PROBE == "no_tpcds": nums = {n for n in nums if id_of[n] != TPCDS_ID}
+        elif PROBE == "empty": nums = set()
         print(json.dumps({"commit": patch.stem, "workers": split(nums, ms)}))
         log(patch.stem, len(nums), "tests |", "; ".join(why))
 

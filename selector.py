@@ -736,6 +736,13 @@ def build_pinned(sel):
     if a != b: log("pinned max_nodes results are not deterministic: check off"); return
     MAXNODES_PINNED.write_text(json.dumps(a)); log("pinned max_nodes results:", len(a))
 
+TPCDS_CPU_MAX, TPCDS_CPU_SHARE = 12.0, 0.6   # v23: CPU cap of one TPC-DS check (seconds; share of its worth)
+
+def _cpu_limit(sec):
+    import resource
+    n = max(1, int(sec))
+    resource.setrlimit(resource.RLIMIT_CPU, (n, n + 1))   # SIGXCPU at n s of CPU, SIGKILL at n + 1
+
 _PERQ = None
 def tpcds_checkable(sel, files):
     """None: cannot be checked (keep TPC-DS). Otherwise the set of executed queries that must be re-run
@@ -779,8 +786,12 @@ def tpcds_checkable(sel, files):
             chosen.add(max(qs, key=lambda q: sum(1 for o in force_lines if q in o)))
     return chosen
 
-def tpcds_unaffected(sel, text):
+def tpcds_unaffected(sel, text, worth=21.0):
+    """worth: seconds of score that dropping the test saves. The check's child process gets a hard CPU
+    limit below that (RLIMIT_CPU), so a check that cannot finish never costs more than it could win."""
     if not (sel.tpcds and PINNED_FP.exists() and TPCDS_RESULTS.exists()): return False
+    cpu_cap = min(TPCDS_CPU_MAX, TPCDS_CPU_SHARE * worth)
+    if cpu_cap < 3: return False
     files = parse_patch(text)
     force = tpcds_checkable(sel, files)
     if force is None: return False
@@ -796,9 +807,10 @@ def tpcds_unaffected(sel, text):
         import subprocess
         r = subprocess.run([sys.executable, "-I", str(APP / "tpcds_res.py"), str(root), str(SPEC), str(PINNED_FP),
                             str(TPCDS_RESULTS), str(TPCDS_DATA)] + (["--force", ",".join(map(str, sorted(force)))] if force else []),
-                           capture_output=True, text=True, timeout=30,
+                           capture_output=True, text=True, timeout=2 * cpu_cap + 5,
+                           preexec_fn=lambda: _cpu_limit(cpu_cap),
                            env={"PYTHONDONTWRITEBYTECODE": "1", "PATH": os.environ.get("PATH", "")})
-        res = json.loads(r.stdout) if r.returncode == 0 else {"ok": False, "why": r.stderr[-200:]}
+        res = json.loads(r.stdout) if r.returncode == 0 else {"ok": False, "why": f"rc {r.returncode} " + r.stderr[-200:]}
         log("  TPC-DS result check:", res)
         return res.get("ok") is True
     finally:
@@ -831,7 +843,8 @@ def aggressive(sel, picked, paths, num_of, text=None):
     n = num_of.get(TPCDS_ID)
     if n in picked and text is not None and TPCDS_CHECK:
         try:
-            if tpcds_unaffected(sel, text): picked = picked - {n}; log("  TPC-DS stage fingerprints unchanged: dropped")
+            worth = commit_cost(picked, MS_ALL) - commit_cost(picked - {n}, MS_ALL) if MS_ALL else 21.0
+            if tpcds_unaffected(sel, text, worth): picked = picked - {n}; log("  TPC-DS stage fingerprints unchanged: dropped")
             else: log("  TPC-DS kept (not checkable, or fingerprints changed)")
         except Exception as e:
             log("  TPC-DS fingerprint check failed, keeping it:", repr(e)[:200])
@@ -841,6 +854,7 @@ def aggressive(sel, picked, paths, num_of, text=None):
 # ---------- in-container runner (fast mode) ----------
 RUNNER = False   # v21: with real deps the runner cost ~19 s CPU for ~5 s simulated (practice)
 PROBE = None   # diagnostic builds only
+MS_ALL = {}    # test number -> recorded ms (set in main)
 RUNNABLE_PATH = APP / "runner_pinned.json"
 _runnable = None
 NEVER_RUN = {"tests/test_generator.py::TestGenerator::test_generator_memory"}   # order/memory sensitive
@@ -910,6 +924,7 @@ def main():
         build_pinned(Selector()); return
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
+    MS_ALL.update(ms)
     sel = Selector()
     num_of = {t["id"]: t["number"] for t in tests}
     id_of = {t["number"]: t["id"] for t in tests}

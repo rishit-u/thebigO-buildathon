@@ -17,6 +17,36 @@ CONFIG_FILES = {"pyproject.toml": ("tool", "pytest"), "setup.cfg": ("tool:pytest
                 ".coveragerc": (), ".coveragerc.toml": ()}
 RISKY_NAMES = {"conftest.py", "pytest.ini", ".pytest.ini", "sitecustomize.py", "usercustomize.py"}
 
+TPC_FIXTURES = {"tests/fixtures/optimizer/tpc-ds/tpc-ds.sql", "tests/fixtures/optimizer/tpc-h/tpc-h.sql"}
+
+def fixture_pairs(text):
+    """tests/helpers.py load_sql_fixture_pairs (with _filter_comments, _extract_meta), on a string."""
+    statements = "\n".join([line for line in text.splitlines() if line and not line.startswith("--")]).split(";")
+    size = len(statements)
+    for i in range(0, size, 2):
+        if i + 1 < size:
+            sql = statements[i].strip()
+            meta = {}; sql_lines = sql.split("\n"); j = 0
+            while sql_lines[j].startswith("#"):
+                key, val = sql_lines[j].split(":", maxsplit=1)
+                meta[key.lstrip("#").strip()] = val.strip()
+                j += 1
+            sql = "\n".join(sql_lines[j:])
+            yield meta, sql, statements[i + 1].strip()
+
+def parses(sqls):
+    """parse_one on each SQL string, with the pinned sqlglot, in a child process (pickled as the pool does)."""
+    import subprocess
+    code = ("import sys, json, pickle; sys.path.insert(0, sys.argv[1]); from sqlglot import parse_one\n"
+            "for q in json.load(sys.stdin): pickle.loads(pickle.dumps(parse_one(q)))\nprint('ok')")
+    try:
+        r = subprocess.run([sys.executable, "-I", "-c", code, str(PINNED_DIR)], input=json.dumps(sqls),
+                           capture_output=True, text=True, timeout=20,
+                           env={"PYTHONDONTWRITEBYTECODE": "1", "PATH": os.environ.get("PATH", ""), "HOME": "/tmp"})
+        return r.returncode == 0 and r.stdout.strip() == "ok"
+    except Exception:
+        return False
+
 def config_unchanged_for_pytest(path, hunks):
     """The edited config still parses and its pytest settings are the same (coverage files: always)."""
     if path.startswith(".coveragerc"): return True    # the tests are not run under coverage when labeled
@@ -497,7 +527,10 @@ class Selector:
                 ts = self.test_source(path, f["hunks"], why)
                 if ts is not None:
                     picked |= ts; self.protect |= ts; continue
-            if f["old"] == f["new"] and path in self.reads and path not in CONFIG_FILES:
+            if f["old"] == f["new"] and path in TPC_FIXTURES and path in self.reads:
+                ts = self.tpc_fixture(path, f["hunks"], why)
+                picked |= ts; self.protect |= ts
+            elif f["old"] == f["new"] and path in self.reads and path not in CONFIG_FILES:
                 picked |= set(self.sets[self.reads[path]]); why.append(f"{path}: fixture readers")
             elif f["old"] == f["new"] and path in self.test_files:
                 picked |= set(self.sets[self.test_files[path]]); why.append(f"{path}: test file")
@@ -507,6 +540,40 @@ class Selector:
                     why.append(f"{path}: unknown kind of change -> all"); return self.ALL, why
                 picked |= ts; self.protect |= ts
         return picked, why
+
+    # ----- the TPC-H / TPC-DS query fixtures -----
+    def tpc_fixture(self, path, hunks, why):
+        """TestExecutor.setUpClass loads both files with tests/helpers.load_sql_fixture_pairs (so every
+        TestExecutor test reads them), but only uses (meta, sql) of tpc-ds in test_execute_tpcds, and of
+        tpc-h in test_execute_tpch, plus (sql, optimized) of tpc-h in test_optimized_tpch. Readers in
+        other classes (test_optimizer's check_file) are kept. If the patched file loads into the same
+        number of pairs, the other TestExecutor tests cannot change."""
+        readers = set(self.sets[self.reads[path]]); id_of = self._ids()
+        src = PINNED_DIR / path
+        try:
+            old_text = src.read_text(encoding="utf-8"); new_text = apply(old_text, hunks)
+            po, pn = list(fixture_pairs(old_text)), list(fixture_pairs(new_text))
+        except Exception as e:
+            why.append(f"{path}: fixture loader fails ({type(e).__name__}) -> {len(readers)} readers"); return readers
+        if len(po) != len(pn):
+            why.append(f"{path}: pairs {len(po)} -> {len(pn)} -> {len(readers)} readers"); return readers
+        ds = "tpc-ds" in path
+        ms_changed = [i for i, (a, b) in enumerate(zip(po, pn)) if a[:2] != b[:2]]
+        sq_changed = [i for i, (a, b) in enumerate(zip(po, pn)) if a[1:] != b[1:]]
+        keep = set()
+        for n in readers:
+            tid = id_of.get(n, "")
+            if not tid.startswith("tests/test_executor.py::TestExecutor::"): keep.add(n); continue
+            name = tid.rsplit("::", 1)[-1]
+            if ds and name == "test_execute_tpcds" and ms_changed:
+                # a changed query that is not executed matters only if parse_one fails on it
+                if any(po[i][0].get("execute") or pn[i][0].get("execute") for i in ms_changed) or \
+                        not parses([pn[i][1] for i in ms_changed]):
+                    keep.add(n)
+            elif not ds and name == "test_execute_tpch" and ms_changed: keep.add(n)
+            elif not ds and name == "test_optimized_tpch" and sq_changed: keep.add(n)
+        why.append(f"{path}: {len(ms_changed)} (meta, sql) pairs changed -> {len(keep)} of {len(readers)} readers")
+        return keep
 
     # ----- test code (tests/**/*.py): per-test line coverage of the test files (testmap.json.gz) -----
     def _tm(self):
@@ -852,7 +919,10 @@ def aggressive(sel, picked, paths, num_of, text=None):
 
 # ---------- splitting over workers ----------
 # ---------- in-container runner (fast mode) ----------
-RUNNER = False   # v21: with real deps the runner cost ~19 s CPU for ~5 s simulated (practice)
+RUNNER = os.environ.get("BR_RUNNER", "0") == "1"   # off by default: on practice it saved one 2 s worker fee for about 2 s CPU (v17)
+RUN_SHARE, RUN_BUDGET = 0.45, 12.0     # run when est. CPU < 45% of the selection's cost; <= 12 s per batch
+HEAVY_SETUP = ("tests/test_optimizer.py", "tests/test_executor.py")   # costly setUpClass (duckdb, data)
+_RUN_CPU = [0.0]
 PROBE = None   # diagnostic builds only
 MS_ALL = {}    # test number -> recorded ms (set in main)
 RUNNABLE_PATH = APP / "runner_pinned.json"
@@ -871,10 +941,15 @@ def run_or_select(sel, text, nums, ms, id_of, why):
         _runnable = set(json.loads(RUNNABLE_PATH.read_text())) if RUNNABLE_PATH.exists() else set()
     ids = [id_of[n] for n in nums]
     if not _runnable or any(i not in _runnable or i in NEVER_RUN for i in ids): return nums
+    # v24: only edits of existing sqlglot modules (fixture and test edits nearly always break their tests,
+    # so running them only adds CPU), small selections, and within a CPU budget for the whole batch
+    if not all(f["old"] == f["new"] and f["new"] and f["new"].startswith("sqlglot/") and f["new"].endswith(".py")
+               and f["new"] in sel.files for f in parse_patch(text)): return nums
     load = sum(ms[n] for n in nums) / 1000
-    est = 0.25 + 1.3 * load                     # warm child: fresh sqlglot import + the tests
+    heavy = any(i.startswith(HEAVY_SETUP) for i in ids)
+    est = 0.2 + 1.5 * load + (0.8 if heavy else 0.0)
     saved_if_clean = commit_cost(nums, ms)
-    if est >= 0.8 * saved_if_clean: return nums   # a breaking commit pays the CPU and saves little
+    if est >= RUN_SHARE * saved_if_clean or _RUN_CPU[0] + est > RUN_BUDGET: return nums
     files = {}
     for f in parse_patch(text):
         rel = f["new"]
@@ -891,14 +966,12 @@ def run_or_select(sel, text, nums, ms, id_of, why):
     runner.warm()
     root = Path(tempfile.mkdtemp(prefix="brrun", dir="/tmp"))
     try:
-        shutil.copytree(PINNED_DIR, root, dirs_exist_ok=True)     # patched tree on disk: sources, fixtures,
-        for rel, src in files.items():                             # subprocesses all see the patched code
-            (root / rel).write_text(src, encoding="utf-8")
-            pyc = (root / rel).parent / "__pycache__"
-            for c in (pyc.glob((root / rel).stem + ".*.pyc") if pyc.exists() else []): c.unlink()
+        link_tree(PINNED_DIR, root, files)     # patched tree on disk: sources, fixtures, subprocesses all
+                                               # see the patched code; unpatched entries are symlinks
         failed = runner.run({}, ids, timeout=max(5, 4 * est), root=str(root))
     finally:
         shutil.rmtree(root, ignore_errors=True)
+    _RUN_CPU[0] += runner.LAST_CPU
     if failed is None:
         why.append("runner: error or timeout, selection kept"); return nums
     num_of_id = {id_of[n]: n for n in nums}
@@ -906,6 +979,31 @@ def run_or_select(sel, text, nums, ms, id_of, why):
     if len(out) != len(failed): return nums                                     # unexpected ids: be safe
     why.append(f"runner: ran {len(nums)} tests ({load:.2f} s recorded, est {est:.2f} s, cpu {runner.LAST_CPU:.2f} s, saved-if-clean {saved_if_clean:.2f} s), {len(out)} failed")
     return out
+
+def link_tree(src, dst, files):
+    """dst mirrors src: real directories only along the paths of the patched files (written as real
+    files, their stale bytecode left out); every other entry is a symlink into src."""
+    need = {}
+    for rel in files:
+        parts = rel.split("/")
+        for i in range(len(parts) - 1): need.setdefault("/".join(parts[:i + 1]), set())
+    def fill(rel_dir):
+        s = src / rel_dir if rel_dir else src; d = dst / rel_dir if rel_dir else dst
+        d.mkdir(parents=True, exist_ok=True)
+        for e in os.scandir(s):
+            r = f"{rel_dir}/{e.name}" if rel_dir else e.name
+            if r in need: fill(r)
+            elif r in files: (d / e.name).write_text(files[r], encoding="utf-8")
+            elif e.name == "__pycache__" and any(f.rsplit("/", 1)[0] == rel_dir for f in files):
+                pd = d / "__pycache__"; pd.mkdir()
+                stems = {f.rsplit("/", 1)[-1][:-3] for f in files if f.rsplit("/", 1)[0] == rel_dir}
+                for c in os.scandir(e.path):
+                    if c.name.split(".")[0] not in stems: os.symlink(c.path, pd / c.name)
+            else: os.symlink(e.path, d / e.name)
+        for r, txt in files.items():   # new files in this directory
+            if r.rsplit("/", 1)[0] == rel_dir and "/" in r and not (d / r.rsplit("/", 1)[-1]).exists():
+                (d / r.rsplit("/", 1)[-1]).write_text(txt, encoding="utf-8")
+    fill("")
 
 def split(nums, ms):
     """Try 1..8 workers, longest test first onto the lightest worker; keep the cheapest."""

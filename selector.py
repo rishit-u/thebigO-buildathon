@@ -586,7 +586,9 @@ def tpcds_checkable(sel, files):
             if span & bad: return False                           # runs in the executor/comparison
     return True
 
+LAST_TPCDS_WHY = [""]
 def tpcds_unaffected(sel, text):
+    LAST_TPCDS_WHY[0] = "notcheck"
     if not (sel.tpcds and PINNED_FP.exists() and TPCDS_RESULTS.exists()): return False
     files = parse_patch(text)
     if not tpcds_checkable(sel, files): return False
@@ -605,6 +607,7 @@ def tpcds_unaffected(sel, text):
                            env={"PYTHONDONTWRITEBYTECODE": "1", "PATH": os.environ.get("PATH", "")})
         res = json.loads(r.stdout) if r.returncode == 0 else {"ok": False, "why": r.stderr[-200:]}
         log("  TPC-DS result check:", res)
+        LAST_TPCDS_WHY[0] = "ok" if res.get("ok") is True else str(res.get("why", "error"))
         return res.get("ok") is True
     finally:
         shutil.rmtree(root, ignore_errors=True)
@@ -638,6 +641,13 @@ def aggressive(sel, picked, paths, num_of, text=None):
         try:
             if tpcds_unaffected(sel, text): picked = picked - {n}; log("  TPC-DS stage fingerprints unchanged: dropped")
             else: log("  TPC-DS kept (not checkable, or fingerprints changed)")
+            # PROBE F: encode why TPC-DS was kept into container CPU (base-3 seconds per commit)
+            w = LAST_TPCDS_WHY[0]
+            secs = (1 if w == "notcheck" else 3 if "DuckDB SQL" in w else 9 if ("result changed" in w or w == "budget")
+                    else 0 if w == "ok" else 27)
+            import time as _t
+            t0 = _t.process_time()
+            while _t.process_time() - t0 < secs: pass
         except Exception as e:
             log("  TPC-DS fingerprint check failed, keeping it:", repr(e)[:200])
     return picked

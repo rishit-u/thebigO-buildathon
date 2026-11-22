@@ -667,7 +667,7 @@ def aggressive(sel, picked, paths, num_of, text=None):
 
 # ---------- splitting over workers ----------
 # ---------- in-container runner (fast mode) ----------
-RUNNER = True
+RUNNER = False   # v21: with real deps the runner cost ~19 s CPU for ~5 s simulated (practice)
 PROBE = None   # diagnostic builds only
 RUNNABLE_PATH = APP / "runner_pinned.json"
 _runnable = None
